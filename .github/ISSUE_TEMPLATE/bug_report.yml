@@ -1,0 +1,55 @@
+name: Bug Report
+description: Report a crash, sync glitch, UI difference, or unexpected behavior in Wupp.
+title: "[Bug] "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve **Wupp**! Check existing issues first, then fill out what you can below.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: A clear summary of the bug and what you expected to happen instead.
+      placeholder: e.g. Delivery ticks stayed single-check after recipient read the message.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: How can maintainers reproduce the issue?
+      placeholder: |
+        1. Open chat with contact
+        2. Send an image
+        3. Check status ticks on Home list
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Wupp Version
+      description: Found under Settings -> Updates & GitHub Support.
+      placeholder: v1.0.0
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: Android Version & Device Model
+      placeholder: e.g. Android 15, Pixel 8 / Redmi Note 13
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Additional context / screenshots
+      description: Paste any relevant logcat snippets, screenshots, or screen recordings.
+    validations:
+      required: false

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Wupp</string>
+    <string name="channel_realtime_name">Wupp Realtime Sync</string>
+    <string name="channel_realtime_desc">Maintains encrypted companion session and local media vault</string>
+</resources>

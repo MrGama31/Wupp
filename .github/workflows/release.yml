@@ -1,0 +1,133 @@
+name: Release APK
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.1)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as pre-release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Wupp Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: whatsbridge/go.mod
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK & Build Tools
+        run: sdkmanager "ndk;27.0.12077973" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Derive version metadata from tag
+        id: meta
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          CLEAN_VER="${TAG#v}"
+          IFS='.' read -r MAJOR MINOR PATCH_REST <<< "${CLEAN_VER}"
+          PATCH="${PATCH_REST%%-*}"
+          MAJOR="${MAJOR:-1}"
+          MINOR="${MINOR:-0}"
+          PATCH="${PATCH:-0}"
+          VER_CODE=$((MAJOR * 10000 + MINOR * 100 + PATCH))
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version_name=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${VER_CODE}" >> "$GITHUB_OUTPUT"
+
+      - name: Build whatsbridge.aar via gomobile
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.0.12077973
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          gomobile init
+          mkdir -p app/libs
+          cd whatsbridge
+          gomobile bind -ldflags="-s -w" -target=android/arm64 -androidapi 26 -o ../app/libs/whatsbridge.aar .
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build Release APK
+        run: |
+          gradle assembleRelease \
+            -PWUPP_GITHUB_REPO=${{ github.repository }} \
+            -PWUPP_VERSION_NAME=${{ steps.meta.outputs.version_name }} \
+            -PWUPP_VERSION_CODE=${{ steps.meta.outputs.version_code }}
+
+      - name: Sign & Package APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          mkdir -p dist
+          UNSIGNED_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          OUT_APK="dist/Wupp-${{ steps.meta.outputs.tag }}-arm64.apk"
+          APKSIGNER="${ANDROID_SDK_ROOT}/build-tools/34.0.0/apksigner"
+          ZIPALIGN="${ANDROID_SDK_ROOT}/build-tools/34.0.0/zipalign"
+
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > release.jks
+            "$ZIPALIGN" -p -f 4 "$UNSIGNED_APK" dist/aligned.apk
+            "$APKSIGNER" sign \
+              --ks release.jks \
+              --ks-pass "env:KEYSTORE_PASSWORD" \
+              --ks-key-alias "$KEY_ALIAS" \
+              --key-pass "env:KEY_PASSWORD" \
+              --out "$OUT_APK" dist/aligned.apk
+            rm -f release.jks dist/aligned.apk
+          else
+            keytool -genkeypair -v -keystore debug-fallback.jks -alias wupp \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android \
+              -dname "CN=Wupp,O=Wupp,C=US"
+            "$ZIPALIGN" -p -f 4 "$UNSIGNED_APK" dist/aligned.apk
+            "$APKSIGNER" sign \
+              --ks debug-fallback.jks \
+              --ks-pass pass:android \
+              --ks-key-alias wupp \
+              --key-pass pass:android \
+              --out "$OUT_APK" dist/aligned.apk
+            rm -f debug-fallback.jks dist/aligned.apk
+          fi
+
+          (cd dist && sha256sum *.apk > SHA256SUMS.txt)
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: "Wupp ${{ steps.meta.outputs.tag }}"
+          generate_release_notes: true
+          prerelease: ${{ github.event.inputs.prerelease == 'true' || contains(steps.meta.outputs.tag, '-') }}
+          files: |
+            dist/*.apk
+            dist/SHA256SUMS.txt

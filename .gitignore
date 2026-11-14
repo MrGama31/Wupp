@@ -1,0 +1,36 @@
+# Gradle & Android build artifacts
+.gradle/
+build/
+app/build/
+captures/
+*.apk
+*.ap_
+*.aab
+*.dex
+*.xapk
+*.apks
+
+# Keystores & signing secrets
+*.jks
+*.keystore
+signing.properties
+
+# Local environment configuration
+local.properties
+
+# IDE files
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Kotlin / KSP generated caches
+.kotlin/
+app/schemas/*.json.tmp
+
+# Go / gomobile temporary outputs (keep checked-in whatsbridge.aar or build in CI)
+whatsbridge/build/
+whatsbridge/*.out
+*.exe
+*.test

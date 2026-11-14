@@ -1,0 +1,28 @@
+name: Feature Request
+description: Propose a new capability, patch toggle, or UI parity improvement for Wupp.
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or missing capability
+      description: What workflow or WhatsApp parity gap does this address?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe how you expect the feature to look or behave.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or references
+      description: Optional screenshots, mockups, or notes on similar behavior.
+    validations:
+      required: false

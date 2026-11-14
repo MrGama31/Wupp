@@ -1,0 +1,488 @@
+package com.wa.beastclient.core.update
+
+import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.Settings
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import com.wa.beastclient.BuildConfig
+import com.wa.beastclient.MainActivity
+import com.wa.beastclient.R
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+
+data class AppReleaseInfo(
+    val tagName: String,
+    val versionName: String,
+    val title: String,
+    val changelog: String,
+    val htmlUrl: String,
+    val publishedAt: String,
+    val apkDownloadUrl: String?,
+    val apkFileName: String?,
+    val apkSizeBytes: Long
+)
+
+sealed interface UpdateUiState {
+    data object Idle : UpdateUiState
+    data class Checking(val silent: Boolean) : UpdateUiState
+    data class UpToDate(val currentVersion: String, val checkedAtMs: Long) : UpdateUiState
+    data class UpdateAvailable(val release: AppReleaseInfo) : UpdateUiState
+    data class Downloading(
+        val release: AppReleaseInfo,
+        val progressPercent: Int,
+        val downloadedBytes: Long,
+        val totalBytes: Long
+    ) : UpdateUiState
+    data class ReadyToInstall(val release: AppReleaseInfo, val apkPath: String) : UpdateUiState
+    data class Error(val message: String, val silent: Boolean) : UpdateUiState
+}
+
+object WuppUpdater {
+    private const val PREFS_NAME = "wupp_updater_prefs"
+    private const val KEY_AUTO_CHECK = "auto_check_enabled"
+    private const val KEY_SKIPPED_TAG = "skipped_release_tag"
+    private const val KEY_LAST_CHECK_MS = "last_check_ms"
+    private const val AUTO_CHECK_INTERVAL_MS = 6L * 60L * 60L * 1000L
+    private const val UPDATE_CHANNEL_ID = "wupp_updates_channel"
+    private const val UPDATE_NOTIFICATION_ID = 4209
+
+    private val _state = MutableStateFlow<UpdateUiState>(UpdateUiState.Idle)
+    val state: StateFlow<UpdateUiState> = _state.asStateFlow()
+
+    private val _autoCheckEnabled = MutableStateFlow(true)
+    val autoCheckEnabled: StateFlow<Boolean> = _autoCheckEnabled.asStateFlow()
+
+    private val _showPromptDialog = MutableStateFlow(false)
+    val showPromptDialog: StateFlow<Boolean> = _showPromptDialog.asStateFlow()
+
+    @Volatile
+    private var initialized = false
+
+    fun init(context: Context) {
+        if (initialized) return
+        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        _autoCheckEnabled.value = prefs.getBoolean(KEY_AUTO_CHECK, true)
+        initialized = true
+    }
+
+    fun setAutoCheckEnabled(context: Context, enabled: Boolean) {
+        init(context)
+        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_AUTO_CHECK, enabled)
+            .apply()
+        _autoCheckEnabled.value = enabled
+    }
+
+    fun openPromptDialog() {
+        _showPromptDialog.value = true
+    }
+
+    fun dismissPromptDialog(context: Context, skipVersion: Boolean = false) {
+        _showPromptDialog.value = false
+        if (skipVersion) {
+            val tag = when (val s = _state.value) {
+                is UpdateUiState.UpdateAvailable -> s.release.tagName
+                is UpdateUiState.ReadyToInstall -> s.release.tagName
+                else -> null
+            }
+            if (!tag.isNullOrBlank()) {
+                context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .putString(KEY_SKIPPED_TAG, tag)
+                    .apply()
+            }
+        }
+    }
+
+    suspend fun checkForUpdates(context: Context, silent: Boolean): UpdateUiState {
+        val appCtx = context.applicationContext
+        init(appCtx)
+        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+        if (silent) {
+            if (!_autoCheckEnabled.value) return _state.value
+            val now = System.currentTimeMillis()
+            val lastCheck = prefs.getLong(KEY_LAST_CHECK_MS, 0L)
+            if (now - lastCheck < AUTO_CHECK_INTERVAL_MS && _state.value !is UpdateUiState.Idle) {
+                return _state.value
+            }
+        }
+
+        if (_state.value is UpdateUiState.Downloading) {
+            if (!silent) _showPromptDialog.value = true
+            return _state.value
+        }
+
+        _state.value = UpdateUiState.Checking(silent = silent)
+        val repoSlug = BuildConfig.GITHUB_REPO.trim().trim('/')
+
+        val result = withContext(Dispatchers.IO) {
+            fetchLatestRelease(repoSlug)
+        }
+
+        prefs.edit().putLong(KEY_LAST_CHECK_MS, System.currentTimeMillis()).apply()
+
+        return result.fold(
+            onSuccess = { release ->
+                val current = BuildConfig.VERSION_NAME
+                if (release != null && isNewerVersion(release.versionName, current)) {
+                    val skipped = prefs.getString(KEY_SKIPPED_TAG, "") ?: ""
+                    val nextState = UpdateUiState.UpdateAvailable(release)
+                    _state.value = nextState
+                    if (!silent || skipped != release.tagName) {
+                        _showPromptDialog.value = true
+                        postUpdateNotification(appCtx, release)
+                    }
+                    nextState
+                } else {
+                    val upToDate = UpdateUiState.UpToDate(current, System.currentTimeMillis())
+                    _state.value = upToDate
+                    upToDate
+                }
+            },
+            onFailure = { err ->
+                val errorState = UpdateUiState.Error(
+                    message = err.message ?: "Unable to check GitHub releases",
+                    silent = silent
+                )
+                _state.value = errorState
+                errorState
+            }
+        )
+    }
+
+    suspend fun downloadUpdate(context: Context, release: AppReleaseInfo) {
+        val appCtx = context.applicationContext
+        val downloadUrl = release.apkDownloadUrl
+        if (downloadUrl.isNullOrBlank()) {
+            _state.value = UpdateUiState.Error(
+                message = "No APK asset attached to ${release.tagName}. Open the GitHub release page to download.",
+                silent = false
+            )
+            return
+        }
+
+        _state.value = UpdateUiState.Downloading(
+            release = release,
+            progressPercent = 0,
+            downloadedBytes = 0L,
+            totalBytes = release.apkSizeBytes
+        )
+
+        val result = withContext(Dispatchers.IO) {
+            runCatching {
+                val downloadsDir = appCtx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                    ?: File(appCtx.filesDir, "updates")
+                if (!downloadsDir.exists()) downloadsDir.mkdirs()
+
+                val safeTag = release.tagName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+                val outFile = File(downloadsDir, "Wupp-$safeTag.apk")
+                val tmpFile = File(downloadsDir, "Wupp-$safeTag.apk.part")
+                if (tmpFile.exists()) tmpFile.delete()
+
+                val conn = openFollowingRedirects(downloadUrl)
+                try {
+                    val code = conn.responseCode
+                    if (code !in 200..299) {
+                        throw IllegalStateException("Download failed (HTTP $code)")
+                    }
+                    val total = conn.contentLengthLong.takeIf { it > 0L } ?: release.apkSizeBytes
+                    conn.inputStream.use { input ->
+                        FileOutputStream(tmpFile).use { output ->
+                            val buf = ByteArray(16 * 1024)
+                            var downloaded = 0L
+                            var lastEmitMs = 0L
+                            while (true) {
+                                val read = input.read(buf)
+                                if (read <= 0) break
+                                output.write(buf, 0, read)
+                                downloaded += read
+                                val now = System.currentTimeMillis()
+                                if (now - lastEmitMs >= 120L || (total > 0 && downloaded >= total)) {
+                                    lastEmitMs = now
+                                    val pct = if (total > 0L) ((downloaded * 100L) / total).toInt().coerceIn(0, 100) else -1
+                                    _state.value = UpdateUiState.Downloading(
+                                        release = release,
+                                        progressPercent = pct,
+                                        downloadedBytes = downloaded,
+                                        totalBytes = total
+                                    )
+                                }
+                            }
+                            output.flush()
+                        }
+                    }
+                } finally {
+                    conn.disconnect()
+                }
+
+                if (!tmpFile.exists() || tmpFile.length() < 1024L) {
+                    throw IllegalStateException("Downloaded APK appears incomplete")
+                }
+                if (outFile.exists()) outFile.delete()
+                if (!tmpFile.renameTo(outFile)) {
+                    tmpFile.copyTo(outFile, overwrite = true)
+                    tmpFile.delete()
+                }
+                outFile
+            }
+        }
+
+        result.fold(
+            onSuccess = { apkFile ->
+                _state.value = UpdateUiState.ReadyToInstall(release, apkFile.absolutePath)
+                installApk(appCtx, apkFile)
+            },
+            onFailure = { err ->
+                _state.value = UpdateUiState.Error(
+                    message = err.message ?: "APK download failed",
+                    silent = false
+                )
+            }
+        )
+    }
+
+    fun installApk(context: Context, apkFile: File): Result<Unit> = runCatching {
+        val appCtx = context.applicationContext
+        if (!apkFile.exists()) {
+            throw IllegalStateException("APK file not found: ${apkFile.name}")
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            !appCtx.packageManager.canRequestPackageInstalls()
+        ) {
+            val permissionIntent = Intent(
+                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                Uri.parse("package:${appCtx.packageName}")
+            ).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            appCtx.startActivity(permissionIntent)
+            throw IllegalStateException("Allow \"Install unknown apps\" for Wupp, then tap Install APK again.")
+        }
+
+        val apkUri = FileProvider.getUriForFile(
+            appCtx,
+            "${BuildConfig.APPLICATION_ID}.fileprovider",
+            apkFile
+        )
+        val installIntent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(apkUri, "application/vnd.android.package-archive")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        appCtx.startActivity(installIntent)
+    }
+
+    private fun fetchLatestRelease(repoSlug: String): Result<AppReleaseInfo?> = runCatching {
+        if (!repoSlug.contains("/")) {
+            throw IllegalStateException("Invalid GitHub repository: $repoSlug")
+        }
+        val latestUrl = "https://api.github.com/repos/$repoSlug/releases/latest"
+        val conn = (URL(latestUrl).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 10_000
+            readTimeout = 12_000
+            setRequestProperty("Accept", "application/vnd.github+json")
+            setRequestProperty("User-Agent", "Wupp-Android/${BuildConfig.VERSION_NAME}")
+        }
+        try {
+            val code = conn.responseCode
+            when (code) {
+                200 -> {
+                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                    parseReleaseJson(JSONObject(body))
+                }
+                404 -> {
+                    // Repository might exist with only pre-releases or zero published releases yet.
+                    fetchFirstReleaseFallback(repoSlug)
+                }
+                else -> {
+                    val errText = conn.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+                    val apiMsg = runCatching { JSONObject(errText).optString("message") }.getOrDefault("")
+                    throw IllegalStateException(
+                        if (apiMsg.isNotBlank()) "GitHub API ($code): $apiMsg" else "GitHub API returned HTTP $code"
+                    )
+                }
+            }
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun fetchFirstReleaseFallback(repoSlug: String): AppReleaseInfo? {
+        val listUrl = "https://api.github.com/repos/$repoSlug/releases?per_page=1"
+        val conn = (URL(listUrl).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 10_000
+            readTimeout = 12_000
+            setRequestProperty("Accept", "application/vnd.github+json")
+            setRequestProperty("User-Agent", "Wupp-Android/${BuildConfig.VERSION_NAME}")
+        }
+        try {
+            if (conn.responseCode == 404) return null
+            if (conn.responseCode !in 200..299) return null
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            val arr = JSONArray(body)
+            if (arr.length() == 0) return null
+            return parseReleaseJson(arr.getJSONObject(0))
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun parseReleaseJson(obj: JSONObject): AppReleaseInfo? {
+        if (obj.optBoolean("draft", false)) return null
+        val tagName = obj.optString("tag_name").trim()
+        if (tagName.isBlank()) return null
+        val versionName = tagName.removePrefix("v").removePrefix("V").trim()
+        val title = obj.optString("name").trim().ifBlank { tagName }
+        val changelog = obj.optString("body").trim().ifBlank { "No changelog notes provided for $tagName." }
+        val htmlUrl = obj.optString("html_url").trim()
+        val publishedAt = obj.optString("published_at").trim()
+
+        val assets = obj.optJSONArray("assets") ?: JSONArray()
+        var bestApkUrl: String? = null
+        var bestApkName: String? = null
+        var bestApkSize = 0L
+        var bestScore = -1
+
+        for (i in 0 until assets.length()) {
+            val asset = assets.optJSONObject(i) ?: continue
+            val name = asset.optString("name")
+            if (!name.endsWith(".apk", ignoreCase = true)) continue
+            val score = when {
+                name.contains("release", ignoreCase = true) && name.contains("arm64", ignoreCase = true) -> 4
+                name.contains("release", ignoreCase = true) -> 3
+                name.contains("arm64", ignoreCase = true) -> 2
+                else -> 1
+            }
+            if (score > bestScore) {
+                bestScore = score
+                bestApkUrl = asset.optString("browser_download_url").takeIf { it.isNotBlank() }
+                bestApkName = name
+                bestApkSize = asset.optLong("size", 0L)
+            }
+        }
+
+        return AppReleaseInfo(
+            tagName = tagName,
+            versionName = versionName,
+            title = title,
+            changelog = changelog,
+            htmlUrl = htmlUrl,
+            publishedAt = publishedAt,
+            apkDownloadUrl = bestApkUrl,
+            apkFileName = bestApkName,
+            apkSizeBytes = bestApkSize
+        )
+    }
+
+    private fun openFollowingRedirects(urlStr: String): HttpURLConnection {
+        var currentUrl = urlStr
+        repeat(6) {
+            val conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
+                instanceFollowRedirects = false
+                connectTimeout = 15_000
+                readTimeout = 30_000
+                setRequestProperty("User-Agent", "Wupp-Android/${BuildConfig.VERSION_NAME}")
+            }
+            val code = conn.responseCode
+            if (code in 300..399) {
+                val location = conn.getHeaderField("Location")
+                conn.disconnect()
+                if (location.isNullOrBlank()) {
+                    throw IllegalStateException("Redirect missing Location header")
+                }
+                currentUrl = URL(URL(currentUrl), location).toString()
+            } else {
+                return conn
+            }
+        }
+        throw IllegalStateException("Too many redirects while downloading update")
+    }
+
+    private fun postUpdateNotification(context: Context, release: AppReleaseInfo) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                UPDATE_CHANNEL_ID,
+                "Wupp Updates",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Notifies when a new Wupp release is published on GitHub"
+            }
+            nm.createNotificationChannel(channel)
+        }
+        val tapIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            putExtra("open_update_prompt", true)
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            UPDATE_NOTIFICATION_ID,
+            tapIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(context, UPDATE_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_wupp)
+            .setContentTitle("Wupp ${release.tagName} available")
+            .setContentText("Tap to review changelog and download the update.")
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .build()
+        nm.notify(UPDATE_NOTIFICATION_ID, notification)
+    }
+
+    fun isNewerVersion(remote: String, current: String): Boolean {
+        val remoteParts = parseNumericVersionParts(remote)
+        val currentParts = parseNumericVersionParts(current)
+        val maxLen = maxOf(remoteParts.size, currentParts.size)
+        for (i in 0 until maxLen) {
+            val r = remoteParts.getOrElse(i) { 0 }
+            val c = currentParts.getOrElse(i) { 0 }
+            if (r != c) return r > c
+        }
+        // If base numbers match, a clean release (e.g. 1.0.1) beats a pre-release (1.0.1-rc1)
+        val remoteHasPre = remote.contains("-")
+        val currentHasPre = current.contains("-")
+        return !remoteHasPre && currentHasPre
+    }
+
+    private fun parseNumericVersionParts(raw: String): List<Int> {
+        val core = raw.trim().removePrefix("v").removePrefix("V").substringBefore("-").substringBefore("+")
+        return core.split(".").map { segment ->
+            segment.takeWhile { it.isDigit() }.toIntOrNull() ?: 0
+        }
+    }
+
+    fun formatByteSize(bytes: Long): String {
+        if (bytes <= 0L) return ""
+        val mb = bytes / (1024.0 * 1024.0)
+        return if (mb >= 1.0) String.format("%.1f MB", mb) else "${bytes / 1024} KB"
+    }
+}

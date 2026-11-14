@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  go-bridge-vet:
+    name: Go Bridge Vet & Build Check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: whatsbridge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: whatsbridge/go.mod
+      - name: Vet Go bridge
+        run: go vet ./...
+
+  android-build:
+    name: Android Build (gomobile + Gradle)
+    needs: go-bridge-vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: whatsbridge/go.mod
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: sdkmanager "ndk;27.0.12077973" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Build whatsbridge.aar via gomobile
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.0.12077973
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          gomobile init
+          mkdir -p app/libs
+          cd whatsbridge
+          gomobile bind -target=android/arm64 -androidapi 26 -o ../app/libs/whatsbridge.aar .
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build Debug APK
+        run: gradle assembleDebug -PWUPP_GITHUB_REPO=${{ github.repository }}
+
+      - name: Upload Debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wupp-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 7

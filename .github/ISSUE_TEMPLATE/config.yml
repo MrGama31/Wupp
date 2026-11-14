@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Releases & APK Downloads
+    url: https://github.com/hanzalaramz/Wupp/releases
+    about: Check the latest official Wupp APK releases and changelogs
