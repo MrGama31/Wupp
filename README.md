@@ -2,12 +2,12 @@
 
 Wupp is an Android client for WhatsApp built with Jetpack Compose and Go (`whatsmeow`). It pairs as a linked companion device and adds privacy controls, view-once capture, channel and status viewing, and in-app updates backed by GitHub Releases.
 
-The app is still under active development and does not have a stable release yet. New work goes to `dev`, and `main` is reserved for tested releases.
+The app is still under active development. Builds before `v1.0.0` are published as pre-releases on GitHub while work lands on `main`.
 
 ## What is in the app
 
 - Chat threads, status updates, communities, and unencrypted channels (`@newsletter`) stored locally in Room with full-text search
-- A Go bridge (`whatsbridge`) compiled to `whatsbridge.aar` that handles the WhatsApp Web companion connection, media decryption, group lock states, reactions, and live read/delivery receipts
+- A Go bridge (`whatsbridge`) compiled to `whatsbridge.aar` that handles the WhatsApp Web companion connection, media decryption, group lock states, reactions, and live read and delivery receipts
 - Privacy switches in Settings to freeze last seen, suppress read, played, and typing indicators, keep deleted messages and statuses, and block disappearing message expiry
 - In-app update checks against GitHub Releases, with changelog previews, APK download progress, and one-tap package installation
 - Built-in bug report, feature request, and feedback dialogs under Settings and the top menu that open pre-filled GitHub issues with app and device details
@@ -16,14 +16,13 @@ The app is still under active development and does not have a stable release yet
 
 `app/` contains the Kotlin and Jetpack Compose Android client. `whatsbridge/` contains the Go source that wraps `go.mau.fi/whatsmeow` via `gomobile`.
 
-## Branches and releases
+## Releases and versioning
 
-Because Wupp has not reached a stable `v1.0.0` yet, development happens on `dev`.
+Wupp uses `main` as its primary branch and distinguishes unstable test builds from stable releases with semantic version tags:
 
-- Push work-in-progress commits and open pull requests against `dev`.
-- Merge `dev` into `main` only when a build has been tested end to end and is ready to ship.
-- Use pre-release tags such as `v0.1.0-alpha.1` or `v1.0.0-beta.1` when testing `.github/workflows/release.yml` on unfinished builds. Any tag containing a hyphen is automatically published as a pre-release on GitHub.
-- Tagging `v1.0.0` (or another version without a hyphen) creates a standard GitHub release that the in-app updater picks up.
+- Hyphenated tags such as `v0.1.0-beta.1` or `v1.0.0-alpha.1` trigger `.github/workflows/release.yml` and automatically publish as a GitHub **Pre-release**.
+- Clean tags such as `v1.0.0` publish as a standard GitHub release and become the **Latest** release checked by the in-app updater.
+- Every commit pushed to `main` also runs [ci.yml](.github/workflows/ci.yml) to verify the Go bridge and debug APK build.
 
 ## Build locally
 
@@ -45,7 +44,7 @@ gradle assembleDebug
 
 ## Signing GitHub releases
 
-Tag pushes matching `v*.*.*` trigger `.github/workflows/release.yml`. If you add the four signing secrets (`KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`) in repository settings, CI signs the APK with your release key. Without those secrets, CI signs with an ephemeral key so test APKs still install during development.
+Tag pushes matching `v*` trigger `.github/workflows/release.yml`. If you add the four signing secrets (`KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`) in repository settings, CI signs the APK with your consistent release key so updates install over older versions without losing data. Without those secrets, CI signs with a temporary key generated for that single run, which installs on a fresh device but requires uninstalling the previous temporary build before updating.
 
 ## Report bugs and send feedback
 
