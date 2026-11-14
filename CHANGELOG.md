@@ -1,21 +1,22 @@
 # Changelog
 
-All notable user-visible changes to Wupp are listed here in plain language.
-
-No release tag has been published on GitHub yet.
+All notable user-visible changes to Wupp are listed here in simple words.
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-11-15
 
 ### Added
 - Mandatory login setup screen after permissions, supporting both QR code scanning and phone number link codes before entering chats
 - In-app GitHub release updater with startup checks, notifications, download progress, changelog viewer, and installer handoff
-- In-app bug report, feature request, and feedback forms with copy-to-clipboard support and GitHub pre-fill
-- Multi-ABI Go bridge (`arm64-v8a`, `armeabi-v7a`, `x86_64`) and GitHub Actions release builds producing signed `arm64-v8a` and `universal` APKs
-- First-launch permission setup screen, privacy controls (Ghost Mode, read/played/typing toggles, anti-delete, view-once vault), channel viewer, status viewer, live message ticks, and emoji reactions
+- In-app bug report, feature request, and feedback forms with one-tap clipboard copy and GitHub pre-fill
+- Multi-ABI Go bridge (`arm64-v8a`, `armeabi-v7a`, `x86_64`) and signed GitHub Releases publishing `arm64-v8a` and `universal` APKs
+- First-launch permission setup screen, privacy toggles (Ghost Mode, read/played/typing controls, anti-delete, view-once vault), channel viewer, status viewer, live message ticks, and emoji reactions
 
 ### Changed
-- Changed Android package ID to `com.wupp.app`
-- Added safer sync cooldowns and version caching to reduce duplicate WhatsApp server requests while keeping normal speed
+- Set Android package ID to `com.wupp.app`
+- Added sync cooldowns and version caching to cut duplicate WhatsApp server requests without slowing down normal use
+- Publish only `arm64-v8a` and multi-ABI `universal` APKs for GitHub Releases
 
 ### Fixed
 - Fixed real-time chat syncing and background push updates

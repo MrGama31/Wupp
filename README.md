@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/hanzalaramz/Wupp/releases"><img src="https://img.shields.io/github/v/release/hanzalaramz/Wupp?include_prereleases&label=release&color=25D366" alt="Wupp release"></a>
+  <a href="https://github.com/hanzalaramz/Wupp/releases/latest"><img src="https://img.shields.io/github/v/release/hanzalaramz/Wupp?label=release&color=25D366" alt="Wupp release"></a>
   <a href="https://github.com/hanzalaramz/Wupp/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/hanzalaramz/Wupp/ci.yml?branch=main&label=CI" alt="CI status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/hanzalaramz/Wupp?color=blue" alt="MIT License"></a>
   <img src="https://img.shields.io/badge/Android-8.0%2B-3DDC84" alt="Android 8.0+">
