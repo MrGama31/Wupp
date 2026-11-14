@@ -368,6 +368,9 @@ interface WaDao {
     @Query("SELECT * FROM statuses ORDER BY timestamp DESC")
     fun observeStatuses(): Flow<List<StatusEntity>>
 
+    @Query("SELECT * FROM statuses WHERE id = :statusId LIMIT 1")
+    suspend fun getStatusById(statusId: String): StatusEntity?
+
     @Query("UPDATE statuses SET local_media_path = :localPath WHERE id = :statusId")
     suspend fun updateStatusMedia(statusId: String, localPath: String)
 

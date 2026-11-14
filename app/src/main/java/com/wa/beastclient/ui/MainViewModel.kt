@@ -311,6 +311,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 .onFailure { err ->
                     showToast("Pair error: ${err.message}")
+                    onResult("")
                 }
         }
     }

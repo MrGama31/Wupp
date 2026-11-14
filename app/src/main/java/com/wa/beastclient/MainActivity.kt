@@ -7,6 +7,17 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -14,6 +25,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.wa.beastclient.core.service.WaRealtimeService
 import com.wa.beastclient.core.update.WuppUpdater
@@ -21,6 +37,8 @@ import com.wa.beastclient.ui.MainViewModel
 import com.wa.beastclient.ui.screens.ChatScreen
 import com.wa.beastclient.ui.screens.FirstInstallSetupScreen
 import com.wa.beastclient.ui.screens.HomeScreen
+import com.wa.beastclient.ui.screens.LinkDeviceScreen
+import com.wa.beastclient.ui.theme.LocalWaColors
 import com.wa.beastclient.ui.theme.WhatsAppTheme
 
 class MainActivity : ComponentActivity() {
@@ -38,6 +56,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             val vm: MainViewModel = viewModel()
             val stealth by vm.stealthConfig.collectAsState()
+            val bridgeStatus by vm.bridgeStatus.collectAsState()
             var setupDone by remember { mutableStateOf(initialSetupDone) }
             var selectedChatJid by rememberSaveable { mutableStateOf<String?>(null) }
 
@@ -48,7 +67,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            BackHandler(enabled = setupDone && selectedChatJid != null) {
+            BackHandler(enabled = setupDone && bridgeStatus.isLoggedIn && selectedChatJid != null) {
                 selectedChatJid = null
             }
 
@@ -63,6 +82,39 @@ class MainActivity : ComponentActivity() {
                             setupDone = true
                             WaRealtimeService.ensureStarted(this@MainActivity)
                         }
+                    )
+                } else if (!bridgeStatus.engineReady) {
+                    val colors = LocalWaColors.current
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(colors.appSurface),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center
+                        ) {
+                            Image(
+                                painter = painterResource(R.drawable.wupp_logo),
+                                contentDescription = "Wupp",
+                                modifier = Modifier
+                                    .size(72.dp)
+                                    .clip(RoundedCornerShape(18.dp))
+                            )
+                            Spacer(modifier = Modifier.height(20.dp))
+                            CircularProgressIndicator(
+                                color = colors.accentGreen,
+                                strokeWidth = 2.5.dp,
+                                modifier = Modifier.size(26.dp)
+                            )
+                        }
+                    }
+                } else if (!bridgeStatus.isLoggedIn) {
+                    LinkDeviceScreen(
+                        bridgeStatus = bridgeStatus,
+                        onPairPhone = { phone, onCode -> vm.pairWithPhoneNumber(phone, onCode) },
+                        onRefreshConnection = { vm.reconnectSocket() }
                     )
                 } else {
                     val activeJid = selectedChatJid

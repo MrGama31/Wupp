@@ -55,6 +55,7 @@ import java.util.concurrent.ConcurrentHashMap
 
 data class BridgeStatus(
     val engineReady: Boolean = false,
+    val isLoggedIn: Boolean = false,
     val connectionState: String = "INITIALIZING",
     val ownJid: String = "",
     val latestQrCode: String? = null,
@@ -71,12 +72,14 @@ data class BridgeStatus(
 class WaRealtimeService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val eventChannel = Channel<Pair<String, String>>(capacity = 2048)
+    private val realtimeChannel = Channel<Pair<String, String>>(capacity = Channel.UNLIMITED)
+    private val syncChannel = Channel<Pair<String, String>>(capacity = Channel.UNLIMITED)
     private lateinit var dao: WaDao
     private var wakeLock: PowerManager.WakeLock? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var hasSeenInitialNetwork = false
     private val pushnameCache = ConcurrentHashMap<String, String>()
+    private val requestedAvatarJids = ConcurrentHashMap.newKeySet<String>()
     private val typingExpiryJobs = ConcurrentHashMap<String, Job>()
 
     override fun onCreate() {
@@ -157,7 +160,8 @@ class WaRealtimeService : Service() {
         unregisterNetworkWatcher()
         releaseSyncWakeLock()
         runCatching { Whatsbridge.disconnectClient() }
-        eventChannel.close()
+        realtimeChannel.close()
+        syncChannel.close()
         serviceScope.cancel()
         if (instance === this) instance = null
         super.onDestroy()
@@ -267,19 +271,35 @@ class WaRealtimeService : Service() {
         serviceScope.launch {
             runCatching {
                 val callback = NativeBridgeCallback { eventType, payloadJson ->
-                    val sent = eventChannel.trySend(eventType to payloadJson)
-                    if (sent.isFailure) {
-                        Log.w(TAG, "Event channel saturated, dropping transient event: $eventType")
+                    if (eventType == "BRIDGE_LOG") {
+                        runCatching {
+                            val json = JSONObject(payloadJson)
+                            val lvl = json.optString("level", "INFO")
+                            val mod = json.optString("module", "Go")
+                            val msg = json.optString("msg")
+                            if (lvl == "ERROR" || lvl == "WARN") {
+                                Log.w("WaBridgeGo", "[$lvl/$mod] $msg")
+                            } else {
+                                Log.i("WaBridgeGo", "[$mod] $msg")
+                            }
+                        }
+                        return@NativeBridgeCallback
                     }
+                    val target = if (eventType == "HISTORY_SYNC_BATCH" || eventType == "CONTACTS_SYNC_BATCH") {
+                        syncChannel
+                    } else {
+                        realtimeChannel
+                    }
+                    target.trySend(eventType to payloadJson)
                 }
                 Whatsbridge.initClient(applicationContext.filesDir.absolutePath, callback)
                 Whatsbridge.setGhostPresence(StealthMatrixManager.config.value.ghostPresence)
-                if (Whatsbridge.isLoggedIn()) {
-                    Whatsbridge.connectClient()
-                }
+                // Always connect cleanly so paired sessions sync immediately and fresh installs stream QR right away.
+                Whatsbridge.connectClient()
             }.onFailure { err ->
                 Log.e(TAG, "Go bridge init failed", err)
                 _bridgeStatus.value = _bridgeStatus.value.copy(
+                    engineReady = true,
                     connectionState = "OFFLINE_READY",
                     lastError = err.message
                 )
@@ -289,7 +309,16 @@ class WaRealtimeService : Service() {
 
     private fun startEventConsumer() {
         serviceScope.launch {
-            for ((eventType, payloadJson) in eventChannel) {
+            for ((eventType, payloadJson) in realtimeChannel) {
+                runCatching {
+                    dispatchEvent(eventType, JSONObject(payloadJson))
+                }.onFailure { err ->
+                    Log.e(TAG, "Error dispatching $eventType: ${err.message}", err)
+                }
+            }
+        }
+        serviceScope.launch {
+            for ((eventType, payloadJson) in syncChannel) {
                 runCatching {
                     dispatchEvent(eventType, JSONObject(payloadJson))
                 }.onFailure { err ->
@@ -303,9 +332,10 @@ class WaRealtimeService : Service() {
         when (eventType) {
             "ENGINE_READY" -> {
                 val own = json.optString("ownJid", "")
-                val loggedIn = json.optBoolean("isLoggedIn", false)
+                val loggedIn = json.optBoolean("isLoggedIn", false) || own.isNotBlank()
                 _bridgeStatus.value = _bridgeStatus.value.copy(
                     engineReady = true,
+                    isLoggedIn = loggedIn,
                     ownJid = own,
                     connectionState = if (loggedIn) "CONNECTING" else "AWAITING_PAIR"
                 )
@@ -313,6 +343,7 @@ class WaRealtimeService : Service() {
             "QR" -> {
                 _bridgeStatus.value = _bridgeStatus.value.copy(
                     latestQrCode = json.optString("code"),
+                    isLoggedIn = false,
                     connectionState = "QR_READY"
                 )
             }
@@ -325,11 +356,20 @@ class WaRealtimeService : Service() {
             "CONNECTION_STATE" -> {
                 val st = json.optString("state", "DISCONNECTED")
                 val own = json.optString("ownJid", _bridgeStatus.value.ownJid)
+                val nextLoggedIn = when (st) {
+                    "LOGGED_OUT" -> false
+                    "PAIRED", "CONNECTED" -> true
+                    else -> _bridgeStatus.value.isLoggedIn || runCatching { Whatsbridge.isLoggedIn() }.getOrDefault(false)
+                }
                 _bridgeStatus.value = _bridgeStatus.value.copy(
+                    engineReady = true,
+                    isLoggedIn = nextLoggedIn,
                     connectionState = st,
-                    ownJid = own
+                    ownJid = if (st == "LOGGED_OUT") "" else own,
+                    latestQrCode = if (nextLoggedIn) null else _bridgeStatus.value.latestQrCode,
+                    latestPairCode = if (nextLoggedIn) null else _bridgeStatus.value.latestPairCode
                 )
-                promoteForeground("Companion: $st")
+                promoteForeground(if (nextLoggedIn) "Companion: $st" else "Waiting to link WhatsApp")
                 if (st == "CONNECTED") {
                     runCatching {
                         Whatsbridge.setGhostPresence(StealthMatrixManager.config.value.ghostPresence)
@@ -479,11 +519,20 @@ class WaRealtimeService : Service() {
     }
 
     private fun triggerContactsAndAvatarsSync(jidsCsv: String) {
-        if (jidsCsv.isBlank()) return
         runCatching {
             Whatsbridge::class.java
                 .getMethod("syncContactsAndAvatars", String::class.java)
                 .invoke(null, jidsCsv)
+        }
+    }
+
+    private fun requestSingleAvatarIfNeeded(jid: String) {
+        val clean = jid.trim()
+        if (clean.isBlank() || clean == "status@broadcast" || !requestedAvatarJids.add(clean)) {
+            return
+        }
+        serviceScope.launch(Dispatchers.IO) {
+            triggerContactsAndAvatarsSync(clean)
         }
     }
 
@@ -511,7 +560,7 @@ class WaRealtimeService : Service() {
             incrementUnread = !isActiveChat
         )
         if (dao.getChat(msg.chatJid)?.avatarPath.isNullOrBlank()) {
-            serviceScope.launch(Dispatchers.IO) { triggerContactsAndAvatarsSync(msg.chatJid) }
+            requestSingleAvatarIfNeeded(msg.chatJid)
         }
         if (isActiveChat) {
             dao.clearLocalUnread(msg.chatJid)
@@ -527,21 +576,30 @@ class WaRealtimeService : Service() {
     }
 
     private suspend fun handleStatusUpsert(json: JSONObject) {
+        val id = json.optString("id")
+        if (id.isBlank()) return
+        val senderJid = json.optString("senderJid")
+        val resolvedName = json.optString("senderName").ifBlank {
+            dao.getChat(senderJid)?.name?.takeIf { it.isNotBlank() }
+                ?: pushnameCache[senderJid]
+                ?: senderJid.substringBefore("@").ifBlank { "Status" }
+        }
+        val existingPath = dao.getStatusById(id)?.localMediaPath?.takeIf {
+            it.isNotBlank() && File(it).exists()
+        }
         val status = StatusEntity(
-            id = json.optString("id"),
-            senderJid = json.optString("senderJid"),
-            senderName = json.optString("senderName").ifBlank {
-                pushnameCache[json.optString("senderJid")] ?: json.optString("senderJid").substringBefore("@")
-            },
+            id = id,
+            senderJid = senderJid,
+            senderName = resolvedName,
             caption = json.optString("body"),
             msgType = json.optString("msgType", "IMAGE"),
             mimeType = json.optString("mimeType"),
-            localMediaPath = null,
+            localMediaPath = existingPath,
             timestamp = json.optLong("timestamp", System.currentTimeMillis())
         )
         dao.upsertStatus(status)
-        if (status.senderJid.isNotBlank() && dao.getChat(status.senderJid)?.avatarPath.isNullOrBlank()) {
-            serviceScope.launch(Dispatchers.IO) { triggerContactsAndAvatarsSync(status.senderJid) }
+        if (senderJid.isNotBlank() && dao.getChat(senderJid)?.avatarPath.isNullOrBlank()) {
+            requestSingleAvatarIfNeeded(senderJid)
         }
     }
 
@@ -957,8 +1015,8 @@ class WaRealtimeService : Service() {
         private const val TAG = "WaRealtimeService"
         private const val CHANNEL_ID = "wa_realtime_channel"
         private const val NOTIF_ID = 1042
-        const val ACTION_RECONNECT = "com.wa.beastclient.action.RECONNECT"
-        const val ACTION_DISCONNECT = "com.wa.beastclient.action.DISCONNECT"
+        const val ACTION_RECONNECT = "com.wupp.app.action.RECONNECT"
+        const val ACTION_DISCONNECT = "com.wupp.app.action.DISCONNECT"
 
         @Volatile
         var instance: WaRealtimeService? = null

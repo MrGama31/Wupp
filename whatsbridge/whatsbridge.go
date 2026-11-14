@@ -71,14 +71,20 @@ type versionCache struct {
 }
 
 const (
-	eventBufferCapacity = 2048
-	mediaQueueCapacity  = 4096
-	mediaWorkers        = 2
-	avatarQueueCapacity = 1024
-	avatarWorkers       = 2
-	avatarMissTTLSec    = 6 * 3600
-	maxDecryptRetries   = 2
+	eventBufferCapacity    = 4096
+	mediaQueueCapacity     = 4096
+	mediaWorkers           = 3
+	avatarQueueCapacity    = 2048
+	avatarWorkers          = 3
+	avatarMissTTLSec       = 6 * 3600
+	avatarUnmappedRetrySec = 60
+	maxDecryptRetries      = 2
 )
+
+type cachedPicInfo struct {
+	URL string
+	ID  string
+}
 
 var (
 	mu                   sync.Mutex
@@ -95,18 +101,21 @@ var (
 	avatarQueue          chan types.JID
 	workersOnce          sync.Once
 	ghostPresence        atomic.Bool
+	contactsSyncRunning  atomic.Bool
 	lastContactsSyncUnix atomic.Int64
 	verifyBulkLastMs     atomic.Int64
 	retryCounts          sync.Map
-	seenMediaMap    sync.Map
-	mediaJobsById   sync.Map
-	historyReqMu    sync.Map
-	peerMediaReqMu  sync.Map
-	mediaRetrySent  sync.Map
-	avatarFetchedMu sync.Map
-	avatarInFlight  sync.Map
-	rngMu           sync.Mutex
-	rng             = rand.New(rand.NewSource(time.Now().UnixNano()))
+	seenMediaMap         sync.Map
+	mediaJobsById        sync.Map
+	historyReqMu         sync.Map
+	peerMediaReqMu       sync.Map
+	mediaRetrySent       sync.Map
+	avatarFetchedMu      sync.Map
+	avatarInFlight       sync.Map
+	newsletterPicURLs    sync.Map
+	deadNewsletters      sync.Map
+	rngMu                sync.Mutex
+	rng                  = rand.New(rand.NewSource(time.Now().UnixNano()))
 )
 
 type bridgeLogger struct {
@@ -116,11 +125,13 @@ type bridgeLogger struct {
 func (l *bridgeLogger) emit(level, msg string, args ...any) {
 	formatted := fmt.Sprintf(msg, args...)
 	fmt.Printf("[%s/%s] %s\n", level, l.module, formatted)
-	emitJSON("BRIDGE_LOG", map[string]any{
-		"level":  level,
-		"module": l.module,
-		"msg":    formatted,
-	})
+	if level == "ERROR" || level == "WARN" {
+		emitJSON("BRIDGE_LOG", map[string]any{
+			"level":  level,
+			"module": l.module,
+			"msg":    formatted,
+		})
+	}
 }
 
 func (l *bridgeLogger) Errorf(msg string, args ...any) { l.emit("ERROR", msg, args...) }
@@ -993,8 +1004,14 @@ func isAvatarNotFoundErr(err error) bool {
 
 func resolveAvatarURL(ctx context.Context, cli *whatsmeow.Client, jid, alt types.JID) (picURL, picID string, notFound bool) {
 	if jid.Server == types.NewsletterServer {
+		if cached, ok := newsletterPicURLs.Load(jid.String()); ok {
+			if info, ok2 := cached.(cachedPicInfo); ok2 && info.URL != "" {
+				return info.URL, info.ID, false
+			}
+		}
 		if meta, nErr := cli.GetNewsletterInfo(ctx, jid); nErr == nil && meta != nil {
 			if u, id := newsletterPictureInfoURL(meta); u != "" {
+				newsletterPicURLs.Store(jid.String(), cachedPicInfo{URL: u, ID: id})
 				return u, id, false
 			}
 		}
@@ -1009,8 +1026,7 @@ func resolveAvatarURL(ctx context.Context, cli *whatsmeow.Client, jid, alt types
 		if err == nil && info != nil && info.URL != "" {
 			return info.URL, info.ID, false
 		}
-		// Explicit not-set / unauthorized means retrying full-size on the same JID wastes an IQ.
-		if isAvatarNotFoundErr(err) {
+		if errors.Is(err, whatsmeow.ErrProfilePictureUnauthorized) {
 			return "", "", true
 		}
 		infoFull, errFull := cli.GetProfilePictureInfo(ctx, target, &whatsmeow.GetProfilePictureParams{
@@ -1042,6 +1058,8 @@ func resolveAvatarURL(ctx context.Context, cli *whatsmeow.Client, jid, alt types
 			return u, id, false
 		} else if nf {
 			notFound = true
+		} else {
+			notFound = false
 		}
 	}
 
@@ -1070,6 +1088,9 @@ func processAvatarJob(jid types.JID, httpCli *http.Client) {
 	alt := resolveAlternateChatJID(ctx, cli, jid)
 	if cached := findCachedAvatar(filesDir, jid.User); cached != "" {
 		avatarFetchedMu.Store(jid.String(), time.Now().Unix())
+		if !alt.IsEmpty() {
+			avatarFetchedMu.Store(alt.String(), time.Now().Unix())
+		}
 		emitJSON("PROFILE_UPDATE", map[string]any{
 			"jid":        jid.String(),
 			"altJid":     alt.String(),
@@ -1082,6 +1103,7 @@ func processAvatarJob(jid types.JID, httpCli *http.Client) {
 	if !alt.IsEmpty() {
 		if cachedAlt := findCachedAvatar(filesDir, alt.User); cachedAlt != "" {
 			avatarFetchedMu.Store(jid.String(), time.Now().Unix())
+			avatarFetchedMu.Store(alt.String(), time.Now().Unix())
 			emitJSON("PROFILE_UPDATE", map[string]any{
 				"jid":        jid.String(),
 				"altJid":     alt.String(),
@@ -1101,9 +1123,14 @@ func processAvatarJob(jid types.JID, httpCli *http.Client) {
 	cancel()
 	if picURL == "" {
 		if notFound {
-			persistAvatarMiss(jid.String(), alt.String())
+			// If this is an @lid without a known PN yet, only pause briefly in memory so PN mapping can resolve later.
+			if jid.Server == types.HiddenUserServer && alt.IsEmpty() {
+				avatarFetchedMu.Store(jid.String(), time.Now().Unix()-avatarMissTTLSec+avatarUnmappedRetrySec)
+			} else {
+				persistAvatarMiss(jid.String(), alt.String())
+			}
 		}
-		time.Sleep(time.Duration(100+int(randomFloat()*120)) * time.Millisecond)
+		time.Sleep(time.Duration(70+int(randomFloat()*80)) * time.Millisecond)
 		return
 	}
 	if picID == "" {
@@ -1118,12 +1145,19 @@ func processAvatarJob(jid types.JID, httpCli *http.Client) {
 			b, readErr := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
 			if (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone) && len(b) == 0 {
-				persistAvatarMiss(jid.String(), alt.String())
+				if jid.Server == types.HiddenUserServer && alt.IsEmpty() {
+					avatarFetchedMu.Store(jid.String(), time.Now().Unix()-avatarMissTTLSec+avatarUnmappedRetrySec)
+				} else {
+					persistAvatarMiss(jid.String(), alt.String())
+				}
 			} else if resp.StatusCode == http.StatusOK && readErr == nil && len(b) > 0 {
 				fname := sanitizeFileName(jid.User + "_" + picID + ".jpg")
 				target := filepath.Join(filesDir, "vault", "avatars", fname)
 				if os.WriteFile(target, b, 0o644) == nil {
 					avatarFetchedMu.Store(jid.String(), time.Now().Unix())
+					if !alt.IsEmpty() {
+						avatarFetchedMu.Store(alt.String(), time.Now().Unix())
+					}
 					emitJSON("PROFILE_UPDATE", map[string]any{
 						"jid":        jid.String(),
 						"altJid":     alt.String(),
@@ -1136,7 +1170,7 @@ func processAvatarJob(jid types.JID, httpCli *http.Client) {
 			}
 		}
 	}
-	time.Sleep(time.Duration(110+int(randomFloat()*130)) * time.Millisecond)
+	time.Sleep(time.Duration(75+int(randomFloat()*85)) * time.Millisecond)
 }
 
 func avatarDownloadWorker() {
@@ -1158,18 +1192,9 @@ func SyncContactsAndAvatars(jidsCsv string) {
 		return
 	}
 
-	nowSec := time.Now().Unix()
-	if strings.TrimSpace(jidsCsv) == "" {
-		prev := lastContactsSyncUnix.Load()
-		if prev > 0 && nowSec-prev < 90 {
-			return
-		}
-	}
-	lastContactsSyncUnix.Store(nowSec)
-
-	// 1. Prioritize active chat JIDs first so visible Home rows resolve immediately.
-	if jidsCsv != "" {
-		resolved := make([]map[string]any, 0, 100)
+	// Targeted lookup for specific chat/status JIDs: never trigger global Group/Newsletter/Contacts sweeps.
+	if strings.TrimSpace(jidsCsv) != "" {
+		resolved := make([]map[string]any, 0, 32)
 		for _, raw := range strings.Split(jidsCsv, ",") {
 			raw = strings.TrimSpace(raw)
 			if raw == "" {
@@ -1196,6 +1221,66 @@ func SyncContactsAndAvatars(jidsCsv string) {
 				"contacts": resolved,
 			})
 		}
+		return
+	}
+
+	nowSec := time.Now().Unix()
+	prev := lastContactsSyncUnix.Load()
+	if prev > 0 && nowSec-prev < 90 {
+		return
+	}
+	if !contactsSyncRunning.CompareAndSwap(false, true) {
+		return
+	}
+	defer contactsSyncRunning.Store(false)
+	lastContactsSyncUnix.Store(nowSec)
+
+	// 1. Fetch all subscribed channels (newsletters) & cache their picture URLs immediately
+	nCtx, nCancel := context.WithTimeout(ctx, 20*time.Second)
+	newsletters, nErr := cli.GetSubscribedNewsletters(nCtx)
+	nCancel()
+	if nErr == nil && len(newsletters) > 0 {
+		nlBatch := make([]map[string]any, 0, len(newsletters))
+		for _, meta := range newsletters {
+			if meta == nil || meta.ID.IsEmpty() {
+				continue
+			}
+			if u, id := newsletterPictureInfoURL(meta); u != "" {
+				newsletterPicURLs.Store(meta.ID.String(), cachedPicInfo{URL: u, ID: id})
+			}
+			isMuted := meta.ViewerMeta != nil && meta.ViewerMeta.Mute == types.NewsletterMuteOn
+			nlBatch = append(nlBatch, map[string]any{
+				"jid":         meta.ID.String(),
+				"name":        strings.TrimSpace(meta.ThreadMeta.Name.Text),
+				"description": strings.TrimSpace(meta.ThreadMeta.Description.Text),
+				"isMuted":     isMuted,
+			})
+			enqueueAvatarFetch(meta.ID)
+		}
+		if len(nlBatch) > 0 {
+			emitJSON("NEWSLETTERS_SYNC_BATCH", map[string]any{
+				"channels": nlBatch,
+			})
+			nlCopy := append([]*types.NewsletterMetadata(nil), newsletters...)
+			go func() {
+				for _, meta := range nlCopy {
+					if meta == nil || meta.ID.IsEmpty() {
+						continue
+					}
+					if _, isDead := deadNewsletters.Load(meta.ID.String()); isDead {
+						continue
+					}
+					emitNewsletterMessages(cli, meta.ID, 20)
+					time.Sleep(time.Duration(200+int(randomFloat()*140)) * time.Millisecond)
+				}
+			}()
+		}
+	} else if nErr != nil {
+		emitJSON("BRIDGE_LOG", map[string]any{
+			"level":  "WARN",
+			"module": "NewsletterSync",
+			"msg":    fmt.Sprintf("GetSubscribedNewsletters error: %v", nErr),
+		})
 	}
 
 	// 2. Fetch all joined groups & communities from server
@@ -1233,48 +1318,6 @@ func SyncContactsAndAvatars(jidsCsv string) {
 			"level":  "WARN",
 			"module": "GroupSync",
 			"msg":    fmt.Sprintf("GetJoinedGroups error: %v", gErr),
-		})
-	}
-
-	// 2b. Fetch all subscribed channels (newsletters) & queue their avatars
-	nCtx, nCancel := context.WithTimeout(ctx, 20*time.Second)
-	newsletters, nErr := cli.GetSubscribedNewsletters(nCtx)
-	nCancel()
-	if nErr == nil && len(newsletters) > 0 {
-		nlBatch := make([]map[string]any, 0, len(newsletters))
-		for _, meta := range newsletters {
-			if meta == nil || meta.ID.IsEmpty() {
-				continue
-			}
-			isMuted := meta.ViewerMeta != nil && meta.ViewerMeta.Mute == types.NewsletterMuteOn
-			nlBatch = append(nlBatch, map[string]any{
-				"jid":         meta.ID.String(),
-				"name":        strings.TrimSpace(meta.ThreadMeta.Name.Text),
-				"description": strings.TrimSpace(meta.ThreadMeta.Description.Text),
-				"isMuted":     isMuted,
-			})
-			enqueueAvatarFetch(meta.ID)
-		}
-		if len(nlBatch) > 0 {
-			emitJSON("NEWSLETTERS_SYNC_BATCH", map[string]any{
-				"channels": nlBatch,
-			})
-			nlCopy := append([]*types.NewsletterMetadata(nil), newsletters...)
-			go func() {
-				for _, meta := range nlCopy {
-					if meta == nil || meta.ID.IsEmpty() {
-						continue
-					}
-					emitNewsletterMessages(cli, meta.ID, 20)
-					time.Sleep(time.Duration(200+int(randomFloat()*140)) * time.Millisecond)
-				}
-			}()
-		}
-	} else if nErr != nil {
-		emitJSON("BRIDGE_LOG", map[string]any{
-			"level":  "WARN",
-			"module": "NewsletterSync",
-			"msg":    fmt.Sprintf("GetSubscribedNewsletters error: %v", nErr),
 		})
 	}
 
@@ -2372,6 +2415,8 @@ func processHistorySync(evt *events.HistorySync) {
 				if pnJID, err1 := types.ParseJID(mapping.GetPnJID()); err1 == nil {
 					if lidJID, err2 := types.ParseJID(mapping.GetLidJID()); err2 == nil {
 						_ = cli.Store.LIDs.PutLIDMapping(baseCtx, lidJID, pnJID)
+						avatarFetchedMu.Delete(lidJID.String())
+						avatarFetchedMu.Delete(pnJID.String())
 					}
 				}
 			}
@@ -2694,12 +2739,36 @@ func processHistoryStatus(cli *whatsmeow.Client, webMsg *waWeb.WebMessageInfo) {
 	if err != nil || parsed == nil {
 		return
 	}
+	if parsed.Info.Sender.IsEmpty() {
+		rawPart := strings.TrimSpace(webMsg.GetKey().GetParticipant())
+		if rawPart == "" {
+			rawPart = strings.TrimSpace(webMsg.GetParticipant())
+		}
+		if rawPart != "" {
+			if pJID, pErr := types.ParseJID(rawPart); pErr == nil && !pJID.IsEmpty() {
+				parsed.Info.Sender = pJID
+			}
+		}
+	}
 	inner, isVO, isEph, ephSec, _ := unwrapMessageContainer(parsed.Message)
 	if inner == nil {
 		return
 	}
 	payload, job := buildNormalizedMessage(&parsed.Info, inner, isVO, isEph, ephSec)
-	enqueueAvatarFetch(parsed.Info.Sender)
+	mt, _ := payload["msgType"].(string)
+	bd, _ := payload["body"].(string)
+	if !isVO && job == nil && mt == "UNKNOWN" && strings.TrimSpace(bd) == "" {
+		return
+	}
+	if !parsed.Info.Sender.IsEmpty() {
+		if normSender := normalizeUserJID(cli, parsed.Info.Sender.String()); normSender != "" {
+			payload["senderJid"] = normSender
+		}
+		if name, _, _ := resolveBestContactName(baseCtx, cli, parsed.Info.Sender); name != "" {
+			payload["senderName"] = name
+		}
+		enqueueAvatarFetch(parsed.Info.Sender)
+	}
 	emitJSON("STATUS_UPSERT", payload)
 	if job != nil {
 		enqueueMedia(job)
@@ -3055,9 +3124,14 @@ func downloadAndEmitMedia(cli *whatsmeow.Client, ctx context.Context, filesDir s
 		data []byte
 		err  error
 	)
-	if job.Msg != nil {
+	if strings.HasSuffix(job.ChatJID, "@newsletter") && len(job.MediaKey) == 0 && job.DirectPath != "" {
+		data, err = cli.DownloadMediaWithOnlyPath(ctx, job.DirectPath)
+		if (err != nil || len(data) == 0) && job.Msg != nil {
+			data, err = cli.Download(ctx, job.Msg)
+		}
+	} else if job.Msg != nil {
 		data, err = cli.Download(ctx, job.Msg)
-		if (err != nil || len(data) == 0) && len(job.MediaKey) == 0 && len(job.FileSHA256) == 0 && job.DirectPath != "" {
+		if (err != nil || len(data) == 0) && len(job.MediaKey) == 0 && job.DirectPath != "" {
 			data, err = cli.DownloadMediaWithOnlyPath(ctx, job.DirectPath)
 		}
 	} else if job.DirectPath != "" && len(job.MediaKey) > 0 {
@@ -3141,8 +3215,7 @@ func downloadAndEmitMedia(cli *whatsmeow.Client, ctx context.Context, filesDir s
 
 func mediaDownloadWorker() {
 	for job := range mediaQueue {
-		// Rule 4: Randomized 150ms-450ms jitter between media downloads
-		jitterMs := 150 + int(randomFloat()*300)
+		jitterMs := 70 + int(randomFloat()*110)
 		time.Sleep(time.Duration(jitterMs) * time.Millisecond)
 
 		mu.Lock()
@@ -3159,6 +3232,9 @@ func emitJSON(eventType string, payload map[string]any) {
 	if eventRing == nil {
 		return
 	}
+	if eventType == "BRIDGE_LOG" && len(eventRing) >= (eventBufferCapacity*3)/4 {
+		return
+	}
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return
@@ -3170,6 +3246,9 @@ func emitJSON(eventType string, payload map[string]any) {
 	select {
 	case eventRing <- ev:
 	default:
+		if eventType == "BRIDGE_LOG" {
+			return
+		}
 		// Ring full: drain one item and push newest so writer never blocks socket loop
 		select {
 		case <-eventRing:
@@ -3440,6 +3519,10 @@ func emitNewsletterMessages(cli *whatsmeow.Client, chJID types.JID, count int) {
 	})
 	cancel()
 	if err != nil {
+		lower := strings.ToLower(err.Error())
+		if strings.Contains(lower, "404") || strings.Contains(lower, "item-not-found") {
+			deadNewsletters.Store(chJID.String(), true)
+		}
 		emitJSON("BRIDGE_LOG", map[string]any{
 			"level":  "WARN",
 			"module": "NewsletterMsgs",
