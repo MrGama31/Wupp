@@ -394,6 +394,7 @@ class WaRealtimeService : Service() {
             "VIEW_ONCE_STRIPPED" -> handleViewOnceStripped(json)
             "UNDECRYPTABLE_STUB" -> handleUndecryptableStub(json)
             "MEDIA_DOWNLOADED" -> handleMediaDownloaded(json)
+            "MEDIA_DOWNLOAD_STATUS" -> handleMediaDownloadStatus(json)
             "RECEIPT" -> handleReceipt(json)
             "PRESENCE" -> handlePresence(json)
             "CHAT_PRESENCE" -> handleChatPresence(json)
@@ -708,6 +709,23 @@ class WaRealtimeService : Service() {
         )
     }
 
+    private fun handleMediaDownloadStatus(json: JSONObject) {
+        val messageId = json.optString("messageId")
+        val status = json.optString("status")
+        val reason = json.optString("reason")
+        if (messageId.isBlank()) return
+        when (status) {
+            "DOWNLOADING" -> {
+                _downloadingMediaIds.value = _downloadingMediaIds.value + messageId
+                _failedMediaIds.value = _failedMediaIds.value - messageId
+            }
+            "FAILED" -> {
+                _downloadingMediaIds.value = _downloadingMediaIds.value - messageId
+                _failedMediaIds.value = _failedMediaIds.value + (messageId to reason.ifBlank { "Tap to retry" })
+            }
+        }
+    }
+
     private suspend fun handleMediaDownloaded(json: JSONObject) {
         val messageId = json.optString("messageId")
         val localPath = json.optString("localPath")
@@ -715,6 +733,11 @@ class WaRealtimeService : Service() {
         val fileSize = json.optLong("fileSize", 0L)
         val waveformCsv = json.optString("waveformCsv")
         val isStatus = json.optBoolean("isStatus", false)
+
+        if (messageId.isNotBlank()) {
+            _downloadingMediaIds.value = _downloadingMediaIds.value - messageId
+            _failedMediaIds.value = _failedMediaIds.value - messageId
+        }
 
         if (isStatus) {
             dao.updateStatusMedia(messageId, localPath)
@@ -1030,6 +1053,12 @@ class WaRealtimeService : Service() {
         private val _announceLockedGroups = MutableStateFlow<Set<String>>(emptySet())
         val announceLockedGroups: StateFlow<Set<String>> = _announceLockedGroups.asStateFlow()
 
+        private val _downloadingMediaIds = MutableStateFlow<Set<String>>(emptySet())
+        val downloadingMediaIds: StateFlow<Set<String>> = _downloadingMediaIds.asStateFlow()
+
+        private val _failedMediaIds = MutableStateFlow<Map<String, String>>(emptyMap())
+        val failedMediaIds: StateFlow<Map<String, String>> = _failedMediaIds.asStateFlow()
+
         private fun reloadGroupLocks(context: Context) {
             val prefs = context.applicationContext.getSharedPreferences("wupp_group_locks", Context.MODE_PRIVATE)
             val saved = prefs.getStringSet("locked_groups", emptySet()) ?: emptySet()
@@ -1096,14 +1125,38 @@ class WaRealtimeService : Service() {
             }
         }
 
-        fun requestMediaDownload(context: Context, msg: MessageEntity) {
+        fun requestMediaDownload(context: Context, msg: MessageEntity, userInitiated: Boolean = true) {
+            if (msg.id.isBlank()) return
+            if (_downloadingMediaIds.value.contains(msg.id)) return
+            if (!userInitiated && _failedMediaIds.value.containsKey(msg.id)) return
+
             val appCtx = context.applicationContext
+            _downloadingMediaIds.value = _downloadingMediaIds.value + msg.id
+            if (userInitiated) {
+                _failedMediaIds.value = _failedMediaIds.value - msg.id
+            }
             companionScope.launch {
-                if (!runCatching { Whatsbridge.isLoggedIn() }.getOrDefault(false)) return@launch
+                if (!runCatching { Whatsbridge.isLoggedIn() }.getOrDefault(false)) {
+                    _downloadingMediaIds.value = _downloadingMediaIds.value - msg.id
+                    return@launch
+                }
                 val dao = WaUiDatabase.getInstance(appCtx).waDao()
                 runCatching {
-                    triggerMediaDownloadWithAnchor(dao, msg)
+                    val hasCached = runCatching { Whatsbridge.hasCachedMediaMeta(msg.id) }.getOrDefault(false)
+                    if (hasCached) {
+                        Whatsbridge.requestMediaDownload(msg.chatJid, msg.senderJid, msg.id, msg.timestamp)
+                    } else {
+                        triggerMediaDownloadWithAnchor(dao, msg)
+                        delay(30_000L)
+                        val refreshed = dao.getMessage(msg.id)
+                        if (refreshed?.localMediaPath.isNullOrBlank() && _downloadingMediaIds.value.contains(msg.id)) {
+                            _downloadingMediaIds.value = _downloadingMediaIds.value - msg.id
+                            _failedMediaIds.value = _failedMediaIds.value + (msg.id to "Tap to retry")
+                        }
+                    }
                 }.onFailure {
+                    _downloadingMediaIds.value = _downloadingMediaIds.value - msg.id
+                    _failedMediaIds.value = _failedMediaIds.value + (msg.id to (it.message ?: "Download failed"))
                     Log.w(TAG, "requestMediaDownload failed for ${msg.id}: ${it.message}")
                 }
             }

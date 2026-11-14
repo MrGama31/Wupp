@@ -71,14 +71,18 @@ type versionCache struct {
 }
 
 const (
-	eventBufferCapacity    = 4096
-	mediaQueueCapacity     = 4096
-	mediaWorkers           = 3
-	avatarQueueCapacity    = 2048
-	avatarWorkers          = 3
-	avatarMissTTLSec       = 6 * 3600
-	avatarUnmappedRetrySec = 60
-	maxDecryptRetries      = 2
+	eventBufferCapacity       = 4096
+	mediaQueueCapacity        = 4096
+	mediaWorkers              = 3
+	avatarQueueCapacity       = 2048
+	avatarWorkers             = 3
+	avatarMissTTLSec          = 6 * 3600
+	avatarUnmappedRetrySec    = 60
+	maxDecryptRetries         = 2
+	autoDownloadVideoMaxBytes = uint64(5 * 1024 * 1024)
+	autoDownloadVaultMaxBytes = uint64(16 * 1024 * 1024)
+	maxManualMediaBytes       = uint64(128 * 1024 * 1024)
+	mediaDownloadTimeout      = 120 * time.Second
 )
 
 type cachedPicInfo struct {
@@ -107,6 +111,7 @@ var (
 	retryCounts          sync.Map
 	seenMediaMap         sync.Map
 	mediaJobsById        sync.Map
+	mediaInFlight        sync.Map
 	historyReqMu         sync.Map
 	peerMediaReqMu       sync.Map
 	mediaRetrySent       sync.Map
@@ -1466,6 +1471,23 @@ func SendPlayedReceiptManual(chatJid string, senderJid string, messageId string)
 }
 
 // RequestMediaDownload downloads media from cached/persisted keys or asks the primary phone to resend it.
+func HasCachedMediaMeta(messageId string) bool {
+	_, ok := lookupMediaJob(messageId)
+	return ok
+}
+
+func emitMediaStatus(messageId, chatJid, status, reason string) {
+	if messageId == "" {
+		return
+	}
+	emitJSON("MEDIA_DOWNLOAD_STATUS", map[string]any{
+		"messageId": messageId,
+		"chatJid":   chatJid,
+		"status":    status,
+		"reason":    reason,
+	})
+}
+
 func RequestMediaDownload(chatJid string, senderJid string, messageId string, timestampMs int64) error {
 	mu.Lock()
 	cli := client
@@ -1480,8 +1502,15 @@ func RequestMediaDownload(chatJid string, senderJid string, messageId string, ti
 	}
 
 	if job, ok := lookupMediaJob(messageId); ok {
+		if _, busy := mediaInFlight.Load(messageId); busy {
+			emitMediaStatus(messageId, job.ChatJID, "DOWNLOADING", "")
+			return nil
+		}
+		emitMediaStatus(messageId, job.ChatJID, "DOWNLOADING", "")
 		go func(j *mediaJob) {
-			okDl := downloadAndEmitMedia(cli, ctx, filesDir, j)
+			dlCtx, cancel := context.WithTimeout(ctx, mediaDownloadTimeout)
+			defer cancel()
+			okDl := downloadAndEmitMedia(cli, dlCtx, filesDir, j)
 			emitJSON("BRIDGE_LOG", map[string]any{
 				"level":  "INFO",
 				"module": "MediaReq",
@@ -1492,6 +1521,7 @@ func RequestMediaDownload(chatJid string, senderJid string, messageId string, ti
 	}
 
 	if cli.Store == nil || cli.Store.ID == nil {
+		emitMediaStatus(messageId, chatJid, "FAILED", "not paired")
 		return errors.New("not paired")
 	}
 
@@ -1503,6 +1533,7 @@ func RequestMediaDownload(chatJid string, senderJid string, messageId string, ti
 
 	chat, err := types.ParseJID(chatJid)
 	if err != nil {
+		emitMediaStatus(messageId, chatJid, "FAILED", err.Error())
 		return err
 	}
 	var sender types.JID
@@ -1517,8 +1548,10 @@ func RequestMediaDownload(chatJid string, senderJid string, messageId string, ti
 		shouldSendHistory = true
 	}
 
+	emitMediaStatus(messageId, chatJid, "DOWNLOADING", "")
 	go func() {
 		if !ensureConnectedAndAuthenticated(cli, 6*time.Second) {
+			emitMediaStatus(messageId, chatJid, "FAILED", "not authenticated")
 			emitJSON("BRIDGE_LOG", map[string]any{
 				"level":  "WARN",
 				"module": "MediaReq",
@@ -2393,7 +2426,7 @@ func processIncomingMessage(evt *events.Message) {
 		emitJSON("MESSAGE_UPSERT", payload)
 	}
 
-	if job != nil {
+	if shouldAutoDownloadMedia(job) {
 		enqueueMedia(job)
 	}
 }
@@ -2722,12 +2755,17 @@ func processHistorySync(evt *events.HistorySync) {
 
 	flush(true)
 
-	// Enqueue voice notes / View Once first so audio isn't starved behind large image backlogs
+	// Enqueue voice notes / View Once first so audio isn't starved behind large image backlogs.
+	// Large videos (> 5 MB) are never auto-downloaded during history sync.
 	for _, job := range priorityMediaJobs {
-		enqueueMedia(job)
+		if shouldAutoDownloadMedia(job) {
+			enqueueMedia(job)
+		}
 	}
 	for _, job := range standardMediaJobs {
-		enqueueMedia(job)
+		if shouldAutoDownloadMedia(job) {
+			enqueueMedia(job)
+		}
 	}
 }
 
@@ -2770,7 +2808,7 @@ func processHistoryStatus(cli *whatsmeow.Client, webMsg *waWeb.WebMessageInfo) {
 		enqueueAvatarFetch(parsed.Info.Sender)
 	}
 	emitJSON("STATUS_UPSERT", payload)
-	if job != nil {
+	if shouldAutoDownloadMedia(job) {
 		enqueueMedia(job)
 	}
 }
@@ -2970,6 +3008,27 @@ func extractContextInfo(m *waE2E.Message) (qId, qSender, qBody, mentionsCsv stri
 	return
 }
 
+func shouldAutoDownloadMedia(job *mediaJob) bool {
+	if job == nil || job.MessageID == "" {
+		return false
+	}
+	switch job.MediaType {
+	case "VIDEO":
+		limit := autoDownloadVideoMaxBytes
+		if job.IsViewOnce || job.IsStatus {
+			limit = autoDownloadVaultMaxBytes
+		}
+		return job.FileLength > 0 && job.FileLength <= limit
+	case "DOCUMENT":
+		return job.FileLength > 0 && job.FileLength <= autoDownloadVaultMaxBytes
+	default:
+		if job.FileLength > maxManualMediaBytes {
+			return false
+		}
+		return true
+	}
+}
+
 func enqueueMedia(job *mediaJob) {
 	if job == nil || mediaQueue == nil {
 		return
@@ -3111,31 +3170,109 @@ func processMediaRetry(evt *events.MediaRetry) {
 	if cli == nil || filesDir == "" {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), mediaDownloadTimeout)
 	defer cancel()
 	downloadAndEmitMedia(cli, ctx, filesDir, job)
 }
 
+func hashFileSHA256(path string) (string, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return "", n, err
+	}
+	return hex.EncodeToString(h.Sum(nil)), n, nil
+}
+
+func moveOrCopyTempFile(tmpPath, targetPath string) error {
+	if err := os.Rename(tmpPath, targetPath); err == nil {
+		return nil
+	}
+	src, err := os.Open(tmpPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	dst, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(dst, src)
+	closeErr := dst.Close()
+	if copyErr != nil {
+		_ = os.Remove(targetPath)
+		return copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(targetPath)
+		return closeErr
+	}
+	_ = os.Remove(tmpPath)
+	return nil
+}
+
 func downloadAndEmitMedia(cli *whatsmeow.Client, ctx context.Context, filesDir string, job *mediaJob) bool {
-	if cli == nil || job == nil {
+	if cli == nil || job == nil || job.MessageID == "" || filesDir == "" {
 		return false
 	}
-	var (
-		data []byte
-		err  error
-	)
+	if _, busy := mediaInFlight.LoadOrStore(job.MessageID, true); busy {
+		return false
+	}
+	defer mediaInFlight.Delete(job.MessageID)
+
+	if job.FileLength > maxManualMediaBytes {
+		emitMediaStatus(job.MessageID, job.ChatJID, "FAILED", "file exceeds 128 MB safety limit")
+		emitJSON("BRIDGE_LOG", map[string]any{
+			"level":  "WARN",
+			"module": "MediaDownload",
+			"msg":    fmt.Sprintf("blocked oversized id=%s type=%s bytes=%d", job.MessageID, job.MediaType, job.FileLength),
+		})
+		return false
+	}
+
+	tmpDir := filepath.Join(filesDir, "media", "tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		emitMediaStatus(job.MessageID, job.ChatJID, "FAILED", err.Error())
+		return false
+	}
+	tmpFile, err := os.CreateTemp(tmpDir, "wupp_dl_*.part")
+	if err != nil {
+		emitMediaStatus(job.MessageID, job.ChatJID, "FAILED", err.Error())
+		return false
+	}
+	tmpPath := tmpFile.Name()
+	keepTmp := false
+	defer func() {
+		_ = tmpFile.Close()
+		if !keepTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	resetTmp := func() {
+		_, _ = tmpFile.Seek(0, 0)
+		_ = tmpFile.Truncate(0)
+	}
+
 	if strings.HasSuffix(job.ChatJID, "@newsletter") && len(job.MediaKey) == 0 && job.DirectPath != "" {
-		data, err = cli.DownloadMediaWithOnlyPath(ctx, job.DirectPath)
-		if (err != nil || len(data) == 0) && job.Msg != nil {
-			data, err = cli.Download(ctx, job.Msg)
+		err = cli.DownloadMediaWithOnlyPathToFile(ctx, job.DirectPath, tmpFile)
+		if err != nil && job.Msg != nil {
+			resetTmp()
+			err = cli.DownloadToFile(ctx, job.Msg, tmpFile)
 		}
 	} else if job.Msg != nil {
-		data, err = cli.Download(ctx, job.Msg)
-		if (err != nil || len(data) == 0) && len(job.MediaKey) == 0 && job.DirectPath != "" {
-			data, err = cli.DownloadMediaWithOnlyPath(ctx, job.DirectPath)
+		err = cli.DownloadToFile(ctx, job.Msg, tmpFile)
+		if err != nil && len(job.MediaKey) == 0 && job.DirectPath != "" {
+			resetTmp()
+			err = cli.DownloadMediaWithOnlyPathToFile(ctx, job.DirectPath, tmpFile)
 		}
 	} else if job.DirectPath != "" && len(job.MediaKey) > 0 {
-		data, err = cli.DownloadMediaWithPath(
+		err = cli.DownloadMediaWithPathToFile(
 			ctx,
 			job.DirectPath,
 			job.FileEncSHA256,
@@ -3144,18 +3281,32 @@ func downloadAndEmitMedia(cli *whatsmeow.Client, ctx context.Context, filesDir s
 			waMediaTypeFromString(job.MediaType),
 			"",
 			len(job.FileSHA256) == 0,
+			tmpFile,
 		)
 	} else if job.DirectPath != "" && strings.HasSuffix(job.ChatJID, "@newsletter") {
-		data, err = cli.DownloadMediaWithOnlyPath(ctx, job.DirectPath)
+		err = cli.DownloadMediaWithOnlyPathToFile(ctx, job.DirectPath, tmpFile)
 	} else {
+		emitMediaStatus(job.MessageID, job.ChatJID, "FAILED", "missing media path")
 		return false
 	}
-	if err != nil || len(data) == 0 {
+
+	_ = tmpFile.Close()
+	stat, statErr := os.Stat(tmpPath)
+	fileBytes := int64(0)
+	if statErr == nil {
+		fileBytes = stat.Size()
+	}
+	if err != nil || fileBytes <= 0 {
+		errReason := "empty download"
+		if err != nil {
+			errReason = err.Error()
+		}
 		emitJSON("BRIDGE_LOG", map[string]any{
 			"level":  "WARN",
 			"module": "MediaDownload",
-			"msg":    fmt.Sprintf("failed id=%s type=%s err=%v bytes=%d", job.MessageID, job.MediaType, err, len(data)),
+			"msg":    fmt.Sprintf("failed id=%s type=%s err=%v bytes=%d", job.MessageID, job.MediaType, err, fileBytes),
 		})
+		emitMediaStatus(job.MessageID, job.ChatJID, "FAILED", errReason)
 		if err != nil && len(job.MediaKey) > 0 &&
 			(errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) ||
 				errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410) ||
@@ -3165,9 +3316,16 @@ func downloadAndEmitMedia(cli *whatsmeow.Client, ctx context.Context, filesDir s
 		}
 		return false
 	}
+	if uint64(fileBytes) > maxManualMediaBytes {
+		emitMediaStatus(job.MessageID, job.ChatJID, "FAILED", "file exceeds 128 MB safety limit")
+		return false
+	}
 
-	sum := sha256.Sum256(data)
-	hashHex := hex.EncodeToString(sum[:])
+	hashHex, hashedLen, hashErr := hashFileSHA256(tmpPath)
+	if hashErr != nil || hashedLen <= 0 {
+		emitMediaStatus(job.MessageID, job.ChatJID, "FAILED", "hash verification failed")
+		return false
+	}
 	ext := extensionForMime(job.MimeType, job.MediaType)
 
 	var targetPath string
@@ -3186,18 +3344,22 @@ func downloadAndEmitMedia(cli *whatsmeow.Client, ctx context.Context, filesDir s
 		}
 	}
 
-	if _, statErr := os.Stat(targetPath); os.IsNotExist(statErr) {
-		if wErr := os.WriteFile(targetPath, data, 0o644); wErr != nil {
+	if stTarget, stErr := os.Stat(targetPath); stErr != nil || stTarget.Size() <= 0 {
+		if mErr := moveOrCopyTempFile(tmpPath, targetPath); mErr != nil {
+			emitMediaStatus(job.MessageID, job.ChatJID, "FAILED", mErr.Error())
 			return false
 		}
+		keepTmp = true
 	}
 	if !job.IsViewOnce && !job.IsStatus {
 		seenMediaMap.Store(hashHex, targetPath)
 	}
 
 	waveform := ""
-	if job.MediaType == "PTT" || job.MediaType == "AUDIO" {
-		waveform = compute40BarWaveform(data)
+	if (job.MediaType == "PTT" || job.MediaType == "AUDIO") && hashedLen <= int64(autoDownloadVaultMaxBytes) {
+		if audioBytes, aErr := os.ReadFile(targetPath); aErr == nil {
+			waveform = compute40BarWaveform(audioBytes)
+		}
 	}
 
 	emitJSON("MEDIA_DOWNLOADED", map[string]any{
@@ -3205,7 +3367,7 @@ func downloadAndEmitMedia(cli *whatsmeow.Client, ctx context.Context, filesDir s
 		"chatJid":     job.ChatJID,
 		"localPath":   targetPath,
 		"sha256":      hashHex,
-		"fileSize":    len(data),
+		"fileSize":    hashedLen,
 		"isViewOnce":  job.IsViewOnce,
 		"isStatus":    job.IsStatus,
 		"waveformCsv": waveform,
@@ -3223,8 +3385,13 @@ func mediaDownloadWorker() {
 		ctx := baseCtx
 		filesDir := appFilesDir
 		mu.Unlock()
+		if cli == nil || ctx == nil {
+			continue
+		}
 
-		_ = downloadAndEmitMedia(cli, ctx, filesDir, &job)
+		dlCtx, cancel := context.WithTimeout(ctx, mediaDownloadTimeout)
+		_ = downloadAndEmitMedia(cli, dlCtx, filesDir, &job)
+		cancel()
 	}
 }
 

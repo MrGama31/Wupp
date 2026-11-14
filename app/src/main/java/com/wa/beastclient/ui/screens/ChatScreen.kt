@@ -2,7 +2,9 @@ package com.wa.beastclient.ui.screens
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -69,6 +71,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -91,6 +94,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -98,7 +102,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
@@ -133,7 +139,9 @@ import com.wa.beastclient.ui.components.WhatsAppClusterInnerShape
 import com.wa.beastclient.ui.components.formatMessageClock
 import com.wa.beastclient.ui.theme.LocalWaColors
 import com.wa.beastclient.ui.theme.LocalWaMonoFamily
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -165,6 +173,8 @@ fun ChatScreen(
     val effectivePrivacy by viewModel.observeEffectivePrivacy(chatJid).collectAsState(initial = null)
     val canSendOutbound by viewModel.canInitiateOutbound(chatJid).collectAsState(initial = true)
     val isRecordingVoice by viewModel.isRecordingVoice.collectAsState()
+    val downloadingMediaIds by viewModel.downloadingMediaIds.collectAsState()
+    val failedMediaIds by viewModel.failedMediaIds.collectAsState()
     val pagedItems = viewModel.pagedMessages(chatJid).collectAsLazyPagingItems()
 
     var draftText by rememberSaveable(chatJid) { mutableStateOf("") }
@@ -618,9 +628,12 @@ fun ChatScreen(
                                         channelDisplayName = channelDisplayName,
                                         showTail = if (isChannel) false else isFirstInCluster,
                                         ghostPlayedActive = effectivePrivacy?.sendPlayedReceipts == false,
+                                        isDownloadingMedia = downloadingMediaIds.contains(msg.id),
+                                        mediaDownloadError = failedMediaIds[msg.id],
                                         onClickEditBadge = { editHistoryTarget = msg },
                                         onManualSendPlayedReceipt = { viewModel.markAudioPlayedExplicitly(msg) },
-                                        onRequestDownload = { viewModel.requestMediaDownload(msg) },
+                                        onAutoRequestDownload = { viewModel.requestMediaDownload(msg, userInitiated = false) },
+                                        onRequestDownload = { viewModel.requestMediaDownload(msg, userInitiated = true) },
                                         onOpenMedia = { mediaLightboxTarget = msg },
                                         onLongPress = {
                                             showMoreReactionEmojis = false
@@ -636,9 +649,12 @@ fun ChatScreen(
                                             channelDisplayName = channelDisplayName,
                                             showTail = isFirstInCluster,
                                             ghostPlayedActive = effectivePrivacy?.sendPlayedReceipts == false,
+                                            isDownloadingMedia = downloadingMediaIds.contains(msg.id),
+                                            mediaDownloadError = failedMediaIds[msg.id],
                                             onClickEditBadge = { editHistoryTarget = msg },
                                             onManualSendPlayedReceipt = { viewModel.markAudioPlayedExplicitly(msg) },
-                                            onRequestDownload = { viewModel.requestMediaDownload(msg) },
+                                            onAutoRequestDownload = { viewModel.requestMediaDownload(msg, userInitiated = false) },
+                                            onRequestDownload = { viewModel.requestMediaDownload(msg, userInitiated = true) },
                                             onOpenMedia = { mediaLightboxTarget = msg },
                                             onLongPress = {
                                                 showMoreReactionEmojis = false
@@ -1269,8 +1285,11 @@ private fun MessageBubbleRow(
     channelDisplayName: String = "",
     showTail: Boolean,
     ghostPlayedActive: Boolean,
+    isDownloadingMedia: Boolean = false,
+    mediaDownloadError: String? = null,
     onClickEditBadge: () -> Unit,
     onManualSendPlayedReceipt: () -> Unit,
+    onAutoRequestDownload: () -> Unit = {},
     onRequestDownload: () -> Unit = {},
     onOpenMedia: () -> Unit,
     onLongPress: () -> Unit
@@ -1585,17 +1604,35 @@ private fun MessageBubbleRow(
                         }
                     }
 
-                    // Photo / Video (edge-to-edge card + auto-download when localMediaPath missing)
+                    // Photo / Video (auto-download images only; small videos <=5MB download in Go, large videos stay tap-to-download)
                     msg.msgType == "IMAGE" || msg.msgType == "VIDEO" -> {
-                        val bmp = remember(msg.localMediaPath) {
+                        val isVideo = msg.msgType == "VIDEO" || msg.mimeType.startsWith("video/", ignoreCase = true)
+                        val localFile = remember(msg.localMediaPath) {
                             msg.localMediaPath?.takeIf { it.isNotBlank() }?.let { p ->
-                                File(p).takeIf { it.exists() }
-                                    ?.let { BitmapFactory.decodeFile(it.absolutePath)?.asImageBitmap() }
+                                File(p).takeIf { it.exists() && it.length() > 0L }
                             }
                         }
-                        LaunchedEffect(msg.id, msg.localMediaPath) {
-                            if (bmp == null) {
-                                onRequestDownload()
+                        val bmp by produceState<ImageBitmap?>(
+                            initialValue = null,
+                            key1 = localFile?.absolutePath,
+                            key2 = isVideo
+                        ) {
+                            value = if (localFile == null) {
+                                null
+                            } else if (!isVideo) {
+                                withContext(Dispatchers.IO) {
+                                    runCatching { BitmapFactory.decodeFile(localFile.absolutePath)?.asImageBitmap() }.getOrNull()
+                                }
+                            } else {
+                                withContext(Dispatchers.IO) {
+                                    extractVideoThumbnailBitmap(localFile.absolutePath)?.asImageBitmap()
+                                }
+                            }
+                        }
+                        LaunchedEffect(msg.id, localFile != null) {
+                            // Never auto-request VIDEO on scroll so large videos never auto-download
+                            if (localFile == null && !isVideo && !isDownloadingMedia && mediaDownloadError == null) {
+                                onAutoRequestDownload()
                             }
                         }
                         Box(
@@ -1603,23 +1640,36 @@ private fun MessageBubbleRow(
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(10.dp))
                                 .clickable {
-                                    if (bmp != null) onOpenMedia() else onRequestDownload()
+                                    if (localFile != null) onOpenMedia() else onRequestDownload()
                                 }
                         ) {
-                            if (bmp != null) {
-                                Image(
-                                    bitmap = bmp,
-                                    contentDescription = msg.body,
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .heightIn(min = 180.dp, max = 300.dp)
-                                )
-                                if (msg.msgType == "VIDEO") {
+                            if (localFile != null) {
+                                if (bmp != null) {
+                                    Image(
+                                        bitmap = bmp!!,
+                                        contentDescription = msg.body,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .heightIn(min = 180.dp, max = 300.dp)
+                                    )
+                                } else {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(210.dp)
+                                            .background(
+                                                Brush.verticalGradient(
+                                                    listOf(Color(0xFF162229), Color(0xFF0B141A))
+                                                )
+                                            )
+                                    )
+                                }
+                                if (isVideo) {
                                     Box(
                                         modifier = Modifier
                                             .align(Alignment.Center)
-                                            .size(48.dp)
+                                            .size(50.dp)
                                             .clip(CircleShape)
                                             .background(Color(0x99000000)),
                                         contentAlignment = Alignment.Center
@@ -1628,8 +1678,25 @@ private fun MessageBubbleRow(
                                             imageVector = Icons.Rounded.PlayArrow,
                                             contentDescription = "Play video",
                                             tint = Color.White,
-                                            modifier = Modifier.size(30.dp)
+                                            modifier = Modifier.size(32.dp)
                                         )
+                                    }
+                                    if (msg.durationSec > 0) {
+                                        Box(
+                                            modifier = Modifier
+                                                .align(Alignment.BottomStart)
+                                                .padding(8.dp)
+                                                .clip(RoundedCornerShape(6.dp))
+                                                .background(Color(0x99000000))
+                                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                                        ) {
+                                            Text(
+                                                text = formatVideoDuration(msg.durationSec),
+                                                color = Color.White,
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Medium
+                                            )
+                                        }
                                     }
                                 }
                             } else {
@@ -1646,24 +1713,53 @@ private fun MessageBubbleRow(
                                     ) {
                                         Box(
                                             modifier = Modifier
-                                                .size(46.dp)
+                                                .size(48.dp)
                                                 .clip(CircleShape)
-                                                .background(Color(0x66000000)),
+                                                .background(Color(0x73000000)),
                                             contentAlignment = Alignment.Center
                                         ) {
-                                            Icon(
-                                                imageVector = if (msg.fileSize > 0) Icons.Rounded.Download else Icons.Rounded.Image,
-                                                contentDescription = "Download ${msg.msgType}",
-                                                tint = Color.White,
-                                                modifier = Modifier.size(24.dp)
-                                            )
+                                            if (isDownloadingMedia) {
+                                                CircularProgressIndicator(
+                                                    color = colors.accentGreen,
+                                                    strokeWidth = 2.5.dp,
+                                                    modifier = Modifier.size(24.dp)
+                                                )
+                                            } else {
+                                                Icon(
+                                                    imageVector = if (isVideo || msg.fileSize > 0) Icons.Rounded.Download else Icons.Rounded.Image,
+                                                    contentDescription = "Download ${msg.msgType}",
+                                                    tint = Color.White,
+                                                    modifier = Modifier.size(24.dp)
+                                                )
+                                            }
                                         }
-                                        val sizeLabel = if (msg.fileSize > 0L) " · ${maxOf(1L, msg.fileSize / 1024L)} KB" else ""
+                                        val sizeLabel = formatMediaSizeLabel(msg.fileSize)
+                                        val stateLabel = when {
+                                            isDownloadingMedia -> if (sizeLabel.isNotBlank()) "Downloading$sizeLabel..." else "Downloading..."
+                                            mediaDownloadError != null -> "Tap to retry$sizeLabel"
+                                            else -> (if (isVideo) "Video" else "Photo") + sizeLabel
+                                        }
                                         Text(
-                                            text = (if (msg.msgType == "VIDEO") "Video" else "Photo") + sizeLabel,
-                                            color = colors.textSecondary,
+                                            text = stateLabel,
+                                            color = if (mediaDownloadError != null && !isDownloadingMedia) Color(0xFFFFB74D) else colors.textSecondary,
                                             fontSize = 12.sp
                                         )
+                                    }
+                                    if (isVideo && msg.durationSec > 0) {
+                                        Box(
+                                            modifier = Modifier
+                                                .align(Alignment.BottomStart)
+                                                .padding(8.dp)
+                                                .clip(RoundedCornerShape(6.dp))
+                                                .background(Color(0x88000000))
+                                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                                        ) {
+                                            Text(
+                                                text = formatVideoDuration(msg.durationSec),
+                                                color = Color.White,
+                                                fontSize = 11.sp
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -1804,4 +1900,42 @@ private fun SystemNoticePill(text: String) {
             )
         }
     }
+}
+
+private fun extractVideoThumbnailBitmap(path: String): Bitmap? {
+    val retriever = MediaMetadataRetriever()
+    return try {
+        retriever.setDataSource(path)
+        val raw = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            ?: retriever.frameAtTime
+            ?: return null
+        val maxSide = maxOf(raw.width, raw.height)
+        if (maxSide <= 720) return raw
+        val scale = 720f / maxSide.toFloat()
+        val w = (raw.width * scale).toInt().coerceAtLeast(1)
+        val h = (raw.height * scale).toInt().coerceAtLeast(1)
+        val scaled = Bitmap.createScaledBitmap(raw, w, h, true)
+        if (scaled != raw) raw.recycle()
+        scaled
+    } catch (_: Throwable) {
+        null
+    } finally {
+        runCatching { retriever.release() }
+    }
+}
+
+private fun formatMediaSizeLabel(bytes: Long): String {
+    if (bytes <= 0L) return ""
+    return if (bytes >= 1024L * 1024L) {
+        String.format(Locale.US, " · %.1f MB", bytes.toDouble() / (1024.0 * 1024.0))
+    } else {
+        " · ${maxOf(1L, bytes / 1024L)} KB"
+    }
+}
+
+private fun formatVideoDuration(seconds: Int): String {
+    val s = seconds.coerceAtLeast(0)
+    val mins = s / 60
+    val rem = s % 60
+    return String.format(Locale.US, "%d:%02d", mins, rem)
 }

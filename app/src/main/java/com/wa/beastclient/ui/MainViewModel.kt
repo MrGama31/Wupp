@@ -184,8 +184,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun requestMediaDownload(msg: MessageEntity) {
-        WaRealtimeService.requestMediaDownload(appContext, msg)
+    val downloadingMediaIds: StateFlow<Set<String>> = WaRealtimeService.downloadingMediaIds
+    val failedMediaIds: StateFlow<Map<String, String>> = WaRealtimeService.failedMediaIds
+
+    fun requestMediaDownload(msg: MessageEntity, userInitiated: Boolean = true) {
+        WaRealtimeService.requestMediaDownload(appContext, msg, userInitiated)
     }
 
     fun observeChat(chatJid: String): Flow<ChatEntity?> = dao.observeChat(chatJid)
