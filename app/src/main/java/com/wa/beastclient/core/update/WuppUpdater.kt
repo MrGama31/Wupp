@@ -68,7 +68,7 @@ object WuppUpdater {
     private val _state = MutableStateFlow<UpdateUiState>(UpdateUiState.Idle)
     val state: StateFlow<UpdateUiState> = _state.asStateFlow()
 
-    private val _autoCheckEnabled = MutableStateFlow(true)
+    private val _autoCheckEnabled = MutableStateFlow(false)
     val autoCheckEnabled: StateFlow<Boolean> = _autoCheckEnabled.asStateFlow()
 
     private val _showPromptDialog = MutableStateFlow(false)
@@ -80,7 +80,7 @@ object WuppUpdater {
     fun init(context: Context) {
         if (initialized) return
         val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        _autoCheckEnabled.value = prefs.getBoolean(KEY_AUTO_CHECK, true)
+        _autoCheckEnabled.value = prefs.getBoolean(KEY_AUTO_CHECK, false)
         initialized = true
     }
 

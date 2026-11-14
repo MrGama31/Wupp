@@ -128,10 +128,6 @@ class WaRealtimeService : Service() {
                             dao.updateChatName(chat.jid, fallbackName, overwrite = false)
                         }
                     }
-                    if (chat.jid == "194944455192756@lid" && (chat.name == "194944455192756" || chat.name == chat.jid || chat.name.isBlank())) {
-                        pushnameCache[chat.jid] = "talha"
-                        dao.updateChatName(chat.jid, "talha", overwrite = true)
-                    }
                 }
             }
         }
