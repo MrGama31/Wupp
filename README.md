@@ -43,11 +43,11 @@ Under the hood, a Go library (`whatsbridge`, built on `whatsmeow` and compiled t
 
 ## Get started
 
-1. Download the `Wupp-<version>-arm64.apk` file from [Releases](https://github.com/hanzalaramz/Wupp/releases) and open it on an Android 8.0 or newer (`arm64-v8a`) device. Android will ask once to allow app installs from your browser or file manager.
+1. Download the matching APK for your device from [Releases](https://github.com/hanzalaramz/Wupp/releases) (`arm64-v8a` for most modern phones, `armeabi-v7a` for older 32-bit phones, `x86_64` for x86 tablets, or `universal` if unsure) and open it on an Android 8.0 or newer device. Android will ask once to allow app installs from your browser or file manager.
 2. Walk through the first-launch setup screen so notification, media, and background-running permissions are granted.
 3. Link your WhatsApp account using the companion pairing dialog (phone number link code) from inside Wupp and **Linked devices** on your primary WhatsApp app.
 
-Future versions prompt inside the app once published on GitHub. If you track releases with [Obtainium](https://github.com/ImranR98/Obtainium), point it at `https://github.com/hanzalaramz/Wupp` and filter assets with `^Wupp-.*-arm64\.apk$` (turn on "Include prereleases" for alpha/beta builds).
+Future versions prompt inside the app and automatically match your phone's CPU architecture once published on GitHub. If you track releases with [Obtainium](https://github.com/ImranR98/Obtainium), point it at `https://github.com/hanzalaramz/Wupp` and filter assets with `^Wupp-.*-arm64-v8a\.apk$` (or `-armeabi-v7a`, `-universal`; turn on "Include prereleases" for alpha/beta builds).
 
 ## What talks to the network
 
@@ -82,10 +82,10 @@ Build the Go AAR first:
 ```bash
 gomobile init
 cd whatsbridge
-gomobile bind -target=android/arm64 -androidapi 26 -o ../app/libs/whatsbridge.aar .
+gomobile bind -target=android/arm64,android/arm,android/amd64 -androidapi 26 -o ../app/libs/whatsbridge.aar .
 ```
 
-`app/build.gradle.kts` reads `BuildConfig.GITHUB_REPO` from `git remote origin`, falling back to `WUPP_GITHUB_REPO` in `gradle.properties`. Once `whatsbridge.aar` is in `app/libs/`, build the debug APK:
+`app/build.gradle.kts` reads `BuildConfig.GITHUB_REPO` from `git remote origin`, falling back to `WUPP_GITHUB_REPO` in `gradle.properties`. Once `whatsbridge.aar` is in `app/libs/`, build the debug APKs:
 
 ```bash
 gradle assembleDebug

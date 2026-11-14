@@ -53,7 +53,7 @@ jobs:
           gomobile init
           mkdir -p app/libs
           cd whatsbridge
-          gomobile bind -target=android/arm64 -androidapi 26 -o ../app/libs/whatsbridge.aar .
+          gomobile bind -javapkg=com.wa.bridge -target=android/arm64,android/arm,android/amd64 -androidapi 26 -o ../app/libs/whatsbridge.aar .
 
       - uses: gradle/actions/setup-gradle@v4
         with:

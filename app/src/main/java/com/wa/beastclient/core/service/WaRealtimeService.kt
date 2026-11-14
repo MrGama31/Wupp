@@ -1090,17 +1090,20 @@ class WaRealtimeService : Service() {
                 val privacy = StealthMatrixManager.getEffectivePrivacy(dao, chatJid)
                 var mentionsCsv = ""
                 if (ghostMentionEveryone && chatJid.endsWith("@g.us")) {
+                    val ownUser = _bridgeStatus.value.ownJid.substringBefore("@").substringBefore(":")
                     mentionsCsv = runCatching {
                         val raw = Whatsbridge.getGroupParticipantsJson(chatJid)
                         val arr = JSONArray(raw)
                         buildList {
-                            for (i in 0 until arr.length()) add(arr.optString(i))
-                        }.filter { it.isNotBlank() }.joinToString(",")
-                    }.getOrElse {
-                        // Local group participant fallback when offline/sandboxed
-                        listOf("15550192834@s.whatsapp.net", "15550198811@s.whatsapp.net", "15550194422@s.whatsapp.net")
-                            .joinToString(",")
-                    }
+                            for (i in 0 until arr.length()) {
+                                val participant = arr.optString(i).trim()
+                                val participantUser = participant.substringBefore("@").substringBefore(":")
+                                if (participant.isNotBlank() && (ownUser.isBlank() || participantUser != ownUser)) {
+                                    add(participant)
+                                }
+                            }
+                        }.distinct().joinToString(",")
+                    }.getOrElse { emptyList<String>().joinToString(",") }
                 }
 
                 val ownJid = _bridgeStatus.value.ownJid.ifBlank { "me@s.whatsapp.net" }

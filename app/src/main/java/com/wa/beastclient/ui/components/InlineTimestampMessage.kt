@@ -62,7 +62,7 @@ fun InlineTimestampMessage(
     val displayText = msg.body
     val timeText = formatMessageClock(msg.timestamp)
     val linkColor = colors.accentGreen
-    val codeBg = colors.surfaceElevated.copy(alpha = 0.65f)
+    val codeBg = colors.elevatedBar.copy(alpha = 0.65f)
     val styledText = androidx.compose.runtime.remember(displayText, linkColor, codeBg) {
         formatWhatsAppBody(displayText, linkColor = linkColor, codeBg = codeBg)
     }

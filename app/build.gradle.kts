@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -39,6 +41,16 @@ val wuppVersionName: String = (
         ?: (project.findProperty("WUPP_VERSION_NAME") as? String)
     )?.trim()?.removePrefix("v")?.takeIf { it.isNotBlank() } ?: "1.0.0"
 
+val signingPropsFile = rootProject.file("signing.properties")
+val signingProps = Properties().apply {
+    if (signingPropsFile.exists()) {
+        signingPropsFile.inputStream().use { load(it) }
+    }
+}
+val hasLocalSigningKey: Boolean = signingProps.getProperty("storeFile")?.let {
+    rootProject.file(it).exists()
+} == true
+
 android {
     namespace = "com.wa.beastclient"
     compileSdk = 34
@@ -47,18 +59,34 @@ android {
         applicationId = "com.wa.beastclient"
         minSdk = 26
         targetSdk = 34
-        versionCode = wuppVersionCode
+        versionCode = wuppVersionCode * 10
         versionName = wuppVersionName
 
         buildConfigField("String", "GITHUB_REPO", "\"$wuppGithubRepo\"")
 
-        ndk {
-            abiFilters += "arm64-v8a"
-        }
-
         ksp {
             arg("room.schemaLocation", "$projectDir/schemas")
             arg("room.generateKotlin", "true")
+        }
+    }
+
+    signingConfigs {
+        if (hasLocalSigningKey) {
+            create("release") {
+                storeFile = rootProject.file(signingProps.getProperty("storeFile"))
+                storePassword = signingProps.getProperty("storePassword")
+                keyAlias = signingProps.getProperty("keyAlias")
+                keyPassword = signingProps.getProperty("keyPassword")
+            }
+        }
+    }
+
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("armeabi-v7a", "arm64-v8a", "x86_64")
+            isUniversalApk = true
         }
     }
 
@@ -69,6 +97,28 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            if (hasLocalSigningKey) {
+                signingConfig = signingConfigs.getByName("release")
+            }
+        }
+    }
+
+    val abiCodes = mapOf(
+        "armeabi-v7a" to 1,
+        "arm64-v8a" to 2,
+        "x86_64" to 3
+    )
+
+    applicationVariants.all {
+        val variant = this
+        outputs.all {
+            val out = this as com.android.build.gradle.internal.api.ApkVariantOutputImpl
+            val abiFilter = out.getFilter(com.android.build.VariantOutput.FilterType.ABI)
+            val abiOffset = abiFilter?.let { abiCodes[it] } ?: 0
+            out.versionCodeOverride = (wuppVersionCode * 10) + abiOffset
+            val abiLabel = abiFilter ?: "universal"
+            val suffix = if (variant.buildType.name == "debug") "-debug" else ""
+            out.outputFileName = "Wupp-${wuppVersionName}-${abiLabel}${suffix}.apk"
         }
     }
 

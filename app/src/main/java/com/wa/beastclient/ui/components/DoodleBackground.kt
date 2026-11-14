@@ -121,8 +121,8 @@ private fun drawDoodleTile(c: Canvas, p: Paint) {
     withTransform(214f, 128f, 22f, 0.95f) {
         val phone = Path().apply {
             moveTo(-10f, -12f)
-            quadraticTo(-14f, 0f, -6f, 10f)
-            quadraticTo(4f, 16f, 12f, 12f)
+            quadTo(-14f, 0f, -6f, 10f)
+            quadTo(4f, 16f, 12f, 12f)
         }
         c.drawPath(phone, p)
         c.drawCircle(-10f, -12f, 3.5f, p)
@@ -207,10 +207,10 @@ private fun drawDoodleTile(c: Canvas, p: Paint) {
     withTransform(318f, 314f, 20f, 0.95f) {
         val sp = Path().apply {
             moveTo(0f, -13f)
-            quadraticTo(0f, 0f, 13f, 0f)
-            quadraticTo(0f, 0f, 0f, 13f)
-            quadraticTo(0f, 0f, -13f, 0f)
-            quadraticTo(0f, 0f, 0f, -13f)
+            quadTo(0f, 0f, 13f, 0f)
+            quadTo(0f, 0f, 0f, 13f)
+            quadTo(0f, 0f, -13f, 0f)
+            quadTo(0f, 0f, 0f, -13f)
         }
         c.drawPath(sp, p)
     }

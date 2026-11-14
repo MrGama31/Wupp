@@ -364,17 +364,29 @@ object WuppUpdater {
         var bestApkName: String? = null
         var bestApkSize = 0L
         var bestScore = -1
+        val supportedAbis = Build.SUPPORTED_ABIS.map { it.lowercase() }
+        val primaryAbi = supportedAbis.firstOrNull().orEmpty()
 
         for (i in 0 until assets.length()) {
             val asset = assets.optJSONObject(i) ?: continue
             val name = asset.optString("name")
             if (!name.endsWith(".apk", ignoreCase = true)) continue
-            val score = when {
-                name.contains("release", ignoreCase = true) && name.contains("arm64", ignoreCase = true) -> 4
-                name.contains("release", ignoreCase = true) -> 3
-                name.contains("arm64", ignoreCase = true) -> 2
-                else -> 1
+            val lower = name.lowercase()
+            val abiScore = when {
+                (lower.contains("arm64-v8a") || lower.contains("arm64") || lower.contains("armv8")) ->
+                    if (primaryAbi.contains("arm64")) 100 else if (supportedAbis.any { it.contains("arm64") }) 70 else -50
+                (lower.contains("armeabi-v7a") || lower.contains("armeabi") || lower.contains("armv7")) ->
+                    if (primaryAbi.contains("armeabi-v7a")) 100 else if (supportedAbis.any { it.contains("armeabi") }) 60 else -50
+                (lower.contains("x86_64") || lower.contains("amd64")) ->
+                    if (primaryAbi == "x86_64") 100 else if (supportedAbis.contains("x86_64")) 60 else -50
+                lower.contains("x86") ->
+                    if (primaryAbi == "x86") 100 else if (supportedAbis.contains("x86")) 55 else -50
+                lower.contains("universal") -> 40
+                else -> 25
             }
+            if (abiScore < 0) continue
+            val releaseBoost = if (lower.contains("release")) 5 else 0
+            val score = abiScore + releaseBoost
             if (score > bestScore) {
                 bestScore = score
                 bestApkUrl = asset.optString("browser_download_url").takeIf { it.isNotBlank() }
@@ -467,10 +479,38 @@ object WuppUpdater {
             val c = currentParts.getOrElse(i) { 0 }
             if (r != c) return r > c
         }
-        // If base numbers match, a clean release (e.g. 1.0.1) beats a pre-release (1.0.1-rc1)
-        val remoteHasPre = remote.contains("-")
-        val currentHasPre = current.contains("-")
-        return !remoteHasPre && currentHasPre
+        val remotePre = parsePreRelease(remote)
+        val currentPre = parsePreRelease(current)
+        if (remotePre == null && currentPre != null) return true
+        if (remotePre != null && currentPre == null) return false
+        if (remotePre == null || currentPre == null) return false
+
+        val preLen = maxOf(remotePre.size, currentPre.size)
+        for (i in 0 until preLen) {
+            val rSeg = remotePre.getOrNull(i)
+            val cSeg = currentPre.getOrNull(i)
+            if (rSeg == null) return false
+            if (cSeg == null) return true
+            val rInt = rSeg.toIntOrNull()
+            val cInt = cSeg.toIntOrNull()
+            when {
+                rInt != null && cInt != null -> if (rInt != cInt) return rInt > cInt
+                rInt != null -> return false
+                cInt != null -> return true
+                else -> {
+                    val cmp = rSeg.compareTo(cSeg, ignoreCase = true)
+                    if (cmp != 0) return cmp > 0
+                }
+            }
+        }
+        return false
+    }
+
+    private fun parsePreRelease(raw: String): List<String>? {
+        val trimmed = raw.trim().removePrefix("v").removePrefix("V").substringBefore("+")
+        if (!trimmed.contains("-")) return null
+        val suffix = trimmed.substringAfter("-").trim()
+        return suffix.takeIf { it.isNotBlank() }?.split(".")
     }
 
     private fun parseNumericVersionParts(raw: String): List<Int> {

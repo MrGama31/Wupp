@@ -74,27 +74,30 @@ const (
 	eventBufferCapacity = 2048
 	mediaQueueCapacity  = 4096
 	mediaWorkers        = 2
-	avatarQueueCapacity = 512
-	avatarWorkers       = 4
+	avatarQueueCapacity = 1024
+	avatarWorkers       = 2
+	avatarMissTTLSec    = 6 * 3600
 	maxDecryptRetries   = 2
 )
 
 var (
-	mu              sync.Mutex
-	client          *whatsmeow.Client
-	container       *sqlstore.Container
-	metaDB          *sql.DB
-	baseCtx         context.Context
-	baseCancel      context.CancelFunc
-	appFilesDir     string
-	eventCallback   NativeBridgeCallback
-	eventRing       chan bridgeEvent
-	mediaQueue      chan mediaJob
-	metaWriteQueue  chan mediaJob
-	avatarQueue     chan types.JID
-	workersOnce     sync.Once
-	ghostPresence   atomic.Bool
-	retryCounts     sync.Map
+	mu                   sync.Mutex
+	client               *whatsmeow.Client
+	container            *sqlstore.Container
+	metaDB               *sql.DB
+	baseCtx              context.Context
+	baseCancel           context.CancelFunc
+	appFilesDir          string
+	eventCallback        NativeBridgeCallback
+	eventRing            chan bridgeEvent
+	mediaQueue           chan mediaJob
+	metaWriteQueue       chan mediaJob
+	avatarQueue          chan types.JID
+	workersOnce          sync.Once
+	ghostPresence        atomic.Bool
+	lastContactsSyncUnix atomic.Int64
+	verifyBulkLastMs     atomic.Int64
+	retryCounts          sync.Map
 	seenMediaMap    sync.Map
 	mediaJobsById   sync.Map
 	historyReqMu    sync.Map
@@ -282,8 +285,49 @@ func initMetaDB(dsn string) error {
 		return err
 	}
 	_, _ = db.Exec(`ALTER TABLE wa_media_meta ADD COLUMN is_from_me INTEGER DEFAULT 0`)
+	_, _ = db.Exec(`
+		CREATE TABLE IF NOT EXISTS wa_avatar_miss (
+			jid TEXT PRIMARY KEY,
+			checked_at INTEGER NOT NULL
+		);
+	`)
+	cutoff := time.Now().Unix() - avatarMissTTLSec
+	_, _ = db.Exec(`DELETE FROM wa_avatar_miss WHERE checked_at < ?`, cutoff)
+	if rows, qErr := db.Query(`SELECT jid, checked_at FROM wa_avatar_miss WHERE checked_at >= ?`, cutoff); qErr == nil {
+		for rows.Next() {
+			var jidStr string
+			var ts int64
+			if rows.Scan(&jidStr, &ts) == nil && jidStr != "" {
+				avatarFetchedMu.Store(jidStr, ts)
+			}
+		}
+		_ = rows.Close()
+	}
 	metaDB = db
 	return nil
+}
+
+func persistAvatarMiss(jids ...string) {
+	now := time.Now().Unix()
+	for _, j := range jids {
+		if j != "" {
+			avatarFetchedMu.Store(j, now)
+		}
+	}
+	mu.Lock()
+	db := metaDB
+	mu.Unlock()
+	if db == nil {
+		return
+	}
+	for _, j := range jids {
+		if j != "" {
+			_, _ = db.Exec(
+				`INSERT INTO wa_avatar_miss (jid, checked_at) VALUES (?, ?) ON CONFLICT(jid) DO UPDATE SET checked_at = excluded.checked_at`,
+				j, now,
+			)
+		}
+	}
 }
 
 func metaWriterWorker() {
@@ -871,7 +915,7 @@ func enqueueAvatarFetch(jid types.JID) {
 		return
 	}
 	now := time.Now().Unix()
-	if prev, ok := avatarFetchedMu.Load(jid.String()); ok && now-prev.(int64) < 1800 {
+	if prev, ok := avatarFetchedMu.Load(jid.String()); ok && now-prev.(int64) < avatarMissTTLSec {
 		return
 	}
 	if _, loaded := avatarInFlight.LoadOrStore(jid.String(), true); loaded {
@@ -954,53 +998,54 @@ func resolveAvatarURL(ctx context.Context, cli *whatsmeow.Client, jid, alt types
 				return u, id, false
 			}
 		}
+		return "", "", false
 	}
 
-	tryParams := []struct {
-		target types.JID
-		params *whatsmeow.GetProfilePictureParams
-	}{
-		{jid, &whatsmeow.GetProfilePictureParams{Preview: true}},
-		{jid, &whatsmeow.GetProfilePictureParams{Preview: false}},
-	}
-	if jid.Server == types.GroupServer {
-		tryParams = append(tryParams,
-			struct {
-				target types.JID
-				params *whatsmeow.GetProfilePictureParams
-			}{jid, &whatsmeow.GetProfilePictureParams{Preview: true, IsCommunity: true}},
-			struct {
-				target types.JID
-				params *whatsmeow.GetProfilePictureParams
-			}{jid, &whatsmeow.GetProfilePictureParams{Preview: false, IsCommunity: true}},
-		)
-	}
-	if !alt.IsEmpty() {
-		tryParams = append(tryParams,
-			struct {
-				target types.JID
-				params *whatsmeow.GetProfilePictureParams
-			}{alt, &whatsmeow.GetProfilePictureParams{Preview: true}},
-			struct {
-				target types.JID
-				params *whatsmeow.GetProfilePictureParams
-			}{alt, &whatsmeow.GetProfilePictureParams{Preview: false}},
-		)
-	}
-
-	sawNotFound := false
-	for _, attempt := range tryParams {
-		info, err := cli.GetProfilePictureInfo(ctx, attempt.target, attempt.params)
+	queryTarget := func(target types.JID, isCommunity bool) (string, string, bool) {
+		info, err := cli.GetProfilePictureInfo(ctx, target, &whatsmeow.GetProfilePictureParams{
+			Preview:     true,
+			IsCommunity: isCommunity,
+		})
 		if err == nil && info != nil && info.URL != "" {
 			return info.URL, info.ID, false
 		}
+		// Explicit not-set / unauthorized means retrying full-size on the same JID wastes an IQ.
 		if isAvatarNotFoundErr(err) {
-			sawNotFound = true
-		} else if err != nil {
-			sawNotFound = false
+			return "", "", true
+		}
+		infoFull, errFull := cli.GetProfilePictureInfo(ctx, target, &whatsmeow.GetProfilePictureParams{
+			Preview:     false,
+			IsCommunity: isCommunity,
+		})
+		if errFull == nil && infoFull != nil && infoFull.URL != "" {
+			return infoFull.URL, infoFull.ID, false
+		}
+		return "", "", isAvatarNotFoundErr(errFull)
+	}
+
+	if u, id, nf := queryTarget(jid, false); u != "" {
+		return u, id, false
+	} else {
+		notFound = nf
+	}
+
+	if jid.Server == types.GroupServer {
+		if u, id, nf := queryTarget(jid, true); u != "" {
+			return u, id, false
+		} else if nf {
+			notFound = true
 		}
 	}
-	return "", "", sawNotFound
+
+	if !alt.IsEmpty() && (alt.User != jid.User || alt.Server != jid.Server) {
+		if u, id, nf := queryTarget(alt, false); u != "" {
+			return u, id, false
+		} else if nf {
+			notFound = true
+		}
+	}
+
+	return "", "", notFound
 }
 
 func setWhatsAppCDNHeaders(req *http.Request) {
@@ -1056,9 +1101,9 @@ func processAvatarJob(jid types.JID, httpCli *http.Client) {
 	cancel()
 	if picURL == "" {
 		if notFound {
-			avatarFetchedMu.Store(jid.String(), time.Now().Unix())
+			persistAvatarMiss(jid.String(), alt.String())
 		}
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(time.Duration(100+int(randomFloat()*120)) * time.Millisecond)
 		return
 	}
 	if picID == "" {
@@ -1073,7 +1118,7 @@ func processAvatarJob(jid types.JID, httpCli *http.Client) {
 			b, readErr := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
 			if (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone) && len(b) == 0 {
-				avatarFetchedMu.Store(jid.String(), time.Now().Unix())
+				persistAvatarMiss(jid.String(), alt.String())
 			} else if resp.StatusCode == http.StatusOK && readErr == nil && len(b) > 0 {
 				fname := sanitizeFileName(jid.User + "_" + picID + ".jpg")
 				target := filepath.Join(filesDir, "vault", "avatars", fname)
@@ -1091,7 +1136,7 @@ func processAvatarJob(jid types.JID, httpCli *http.Client) {
 			}
 		}
 	}
-	time.Sleep(180 * time.Millisecond)
+	time.Sleep(time.Duration(110+int(randomFloat()*130)) * time.Millisecond)
 }
 
 func avatarDownloadWorker() {
@@ -1113,48 +1158,43 @@ func SyncContactsAndAvatars(jidsCsv string) {
 		return
 	}
 
-	// 1. Emit all saved contacts / pushnames from sqlstore.Contacts (bridging LID <-> PN)
-	if cli.Store != nil && cli.Store.Contacts != nil {
-		if allContacts, err := cli.Store.Contacts.GetAllContacts(ctx); err == nil {
-			batch := make([]map[string]any, 0, 200)
-			flushContacts := func() {
-				if len(batch) == 0 {
-					return
-				}
-				emitJSON("CONTACTS_SYNC_BATCH", map[string]any{
-					"contacts": batch,
-				})
-				batch = batch[:0]
+	nowSec := time.Now().Unix()
+	if strings.TrimSpace(jidsCsv) == "" {
+		prev := lastContactsSyncUnix.Load()
+		if prev > 0 && nowSec-prev < 90 {
+			return
+		}
+	}
+	lastContactsSyncUnix.Store(nowSec)
+
+	// 1. Prioritize active chat JIDs first so visible Home rows resolve immediately.
+	if jidsCsv != "" {
+		resolved := make([]map[string]any, 0, 100)
+		for _, raw := range strings.Split(jidsCsv, ",") {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				continue
 			}
-			for cJid, info := range allContacts {
-				enqueueAvatarFetch(cJid)
-				alt := resolveAlternateChatJID(ctx, cli, cJid)
-				name := strings.TrimSpace(info.FullName)
-				isCustom := name != ""
-				if name == "" {
-					name = strings.TrimSpace(info.FirstName)
-					isCustom = name != ""
-				}
-				if name == "" {
-					name = strings.TrimSpace(info.BusinessName)
-				}
-				if name == "" {
-					name = strings.TrimSpace(info.PushName)
-				}
-				if name == "" {
-					continue
-				}
-				batch = append(batch, map[string]any{
-					"jid":      cJid.String(),
-					"altJid":   alt.String(),
-					"name":     name,
-					"isCustom": isCustom,
-				})
-				if len(batch) >= 200 {
-					flushContacts()
+			parsed, err := types.ParseJID(raw)
+			if err != nil || parsed.IsEmpty() {
+				continue
+			}
+			enqueueAvatarFetch(parsed)
+			if parsed.Server != types.GroupServer && parsed.Server != types.NewsletterServer {
+				if name, isCustom, alt := resolveBestContactName(ctx, cli, parsed); name != "" {
+					resolved = append(resolved, map[string]any{
+						"jid":      parsed.String(),
+						"altJid":   alt.String(),
+						"name":     name,
+						"isCustom": isCustom,
+					})
 				}
 			}
-			flushContacts()
+		}
+		if len(resolved) > 0 {
+			emitJSON("CONTACTS_SYNC_BATCH", map[string]any{
+				"contacts": resolved,
+			})
 		}
 	}
 
@@ -1226,7 +1266,7 @@ func SyncContactsAndAvatars(jidsCsv string) {
 						continue
 					}
 					emitNewsletterMessages(cli, meta.ID, 20)
-					time.Sleep(150 * time.Millisecond)
+					time.Sleep(time.Duration(200+int(randomFloat()*140)) * time.Millisecond)
 				}
 			}()
 		}
@@ -1238,34 +1278,48 @@ func SyncContactsAndAvatars(jidsCsv string) {
 		})
 	}
 
-	// 3. Resolve names and queue avatar downloads for existing chat JIDs
-	if jidsCsv != "" {
-		resolved := make([]map[string]any, 0, 100)
-		for _, raw := range strings.Split(jidsCsv, ",") {
-			raw = strings.TrimSpace(raw)
-			if raw == "" {
-				continue
+	// 3. Emit saved contacts / pushnames from sqlstore.Contacts and queue background avatars
+	if cli.Store != nil && cli.Store.Contacts != nil {
+		if allContacts, err := cli.Store.Contacts.GetAllContacts(ctx); err == nil {
+			batch := make([]map[string]any, 0, 200)
+			flushContacts := func() {
+				if len(batch) == 0 {
+					return
+				}
+				emitJSON("CONTACTS_SYNC_BATCH", map[string]any{
+					"contacts": batch,
+				})
+				batch = batch[:0]
 			}
-			parsed, err := types.ParseJID(raw)
-			if err != nil || parsed.IsEmpty() {
-				continue
-			}
-			enqueueAvatarFetch(parsed)
-			if parsed.Server != types.GroupServer && parsed.Server != types.NewsletterServer {
-				if name, isCustom, alt := resolveBestContactName(ctx, cli, parsed); name != "" {
-					resolved = append(resolved, map[string]any{
-						"jid":      parsed.String(),
-						"altJid":   alt.String(),
-						"name":     name,
-						"isCustom": isCustom,
-					})
+			for cJid, info := range allContacts {
+				alt := resolveAlternateChatJID(ctx, cli, cJid)
+				name := strings.TrimSpace(info.FullName)
+				isCustom := name != ""
+				if name == "" {
+					name = strings.TrimSpace(info.FirstName)
+					isCustom = name != ""
+				}
+				if name == "" {
+					name = strings.TrimSpace(info.BusinessName)
+				}
+				if name == "" {
+					name = strings.TrimSpace(info.PushName)
+				}
+				if name == "" {
+					continue
+				}
+				enqueueAvatarFetch(cJid)
+				batch = append(batch, map[string]any{
+					"jid":      cJid.String(),
+					"altJid":   alt.String(),
+					"name":     name,
+					"isCustom": isCustom,
+				})
+				if len(batch) >= 200 {
+					flushContacts()
 				}
 			}
-		}
-		if len(resolved) > 0 {
-			emitJSON("CONTACTS_SYNC_BATCH", map[string]any{
-				"contacts": resolved,
-			})
+			flushContacts()
 		}
 	}
 }
@@ -1470,6 +1524,9 @@ func RequestMediaDownload(chatJid string, senderJid string, messageId string, ti
 				"msg": fmt.Sprintf("peer req chat=%s sender=%s id=%s unavailId=%s unavailErr=%v histId=%s histErr=%v",
 					tChat.String(), tSender.String(), messageId, uResp.ID, uErr, hResp.ID, hErr),
 			})
+			if uErr == nil && (!shouldSendHistory || tChat.Server == types.NewsletterServer || hErr == nil) {
+				break
+			}
 		}
 	}()
 	return nil
@@ -1548,13 +1605,25 @@ func VerifyNumbersOnWhatsApp(phonesCsv string) (string, error) {
 	if cli == nil || !cli.IsConnected() {
 		return "[]", errors.New("client not connected")
 	}
+	nowMs := time.Now().UnixMilli()
+	prevMs := verifyBulkLastMs.Load()
+	if prevMs > 0 && nowMs-prevMs < 2000 {
+		return "[]", errors.New("please wait 2 seconds between number verification batches")
+	}
 	var phones []string
 	for _, p := range strings.Split(phonesCsv, ",") {
 		p = strings.TrimSpace(p)
 		if p != "" {
 			phones = append(phones, p)
+			if len(phones) >= 25 {
+				break
+			}
 		}
 	}
+	if len(phones) == 0 {
+		return "[]", nil
+	}
+	verifyBulkLastMs.Store(nowMs)
 	res, err := cli.IsOnWhatsApp(ctx, phones)
 	if err != nil {
 		return "[]", err
