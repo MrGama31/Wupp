@@ -1,19 +1,19 @@
-name: Bug Report
-description: Report a crash, sync glitch, UI difference, or unexpected behavior in Wupp.
+name: Bug report
+description: Report a bug or unexpected behavior in Wupp
 title: "[Bug] "
 labels: ["bug", "triage"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve **Wupp**! Check existing issues first, then fill out what you can below.
+        Check existing issues first so duplicates stay low, then fill in what you know below.
 
   - type: textarea
     id: summary
     attributes:
-      label: What happened?
-      description: A clear summary of the bug and what you expected to happen instead.
-      placeholder: e.g. Delivery ticks stayed single-check after recipient read the message.
+      label: What happened
+      description: Describe what broke and what you expected instead.
+      placeholder: Delivery ticks stayed on one grey check after the contact read the message.
     validations:
       required: true
 
@@ -21,19 +21,19 @@ body:
     id: steps
     attributes:
       label: Steps to reproduce
-      description: How can maintainers reproduce the issue?
+      description: List the steps needed to trigger the bug.
       placeholder: |
-        1. Open chat with contact
-        2. Send an image
-        3. Check status ticks on Home list
+        1. Open a chat thread
+        2. Send a photo
+        3. Return to the chat list and check the tick status
     validations:
       required: false
 
   - type: input
     id: version
     attributes:
-      label: Wupp Version
-      description: Found under Settings -> Updates & GitHub Support.
+      label: Wupp version
+      description: Shown in Settings under Updates & GitHub Support.
       placeholder: v1.0.0
     validations:
       required: true
@@ -41,15 +41,15 @@ body:
   - type: input
     id: device
     attributes:
-      label: Android Version & Device Model
-      placeholder: e.g. Android 15, Pixel 8 / Redmi Note 13
+      label: Android version and device
+      placeholder: Android 15, Redmi Note 13
     validations:
       required: false
 
   - type: textarea
     id: logs
     attributes:
-      label: Additional context / screenshots
-      description: Paste any relevant logcat snippets, screenshots, or screen recordings.
+      label: Context or screenshots
+      description: Optional logcat output, screenshots, or screen recordings.
     validations:
       required: false

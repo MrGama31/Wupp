@@ -1,14 +1,9 @@
-# Security Policy
+# Security policy
 
-## Reporting a Vulnerability
+## Reporting a vulnerability
 
-Please **do not** open a public GitHub issue for security vulnerabilities, authentication leaks, or credential-handling bugs.
+Do not file security bugs, credential leaks, or session-handling vulnerabilities as public GitHub issues. Report them privately through GitHub's Security tab if Private Vulnerability Reporting is enabled on this repository, or contact the maintainer directly with reproduction steps and the affected Wupp version.
 
-Instead:
-- Use GitHub's **Private Vulnerability Reporting** ("Report a vulnerability" under the Security tab) if enabled on the repository, or contact the repository maintainer directly.
-- Include steps to reproduce, affected Wupp version, and impact assessment.
+## Handling local data
 
-## Local Security Notes
-
-- Session credentials and WhatsApp companion keys are stored locally on-device; never attach databases or keystores to issues or pull requests.
-- Releases published via `.github/workflows/release.yml` include `SHA256SUMS.txt` checksums for APK verification.
+Wupp stores WhatsApp companion session keys, contacts, and downloaded media on the device. Never upload databases, session files, or signing keystores to issues or pull requests. Releases built by `.github/workflows/release.yml` include `SHA256SUMS.txt` so users can check downloaded APKs.

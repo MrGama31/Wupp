@@ -1,17 +1,17 @@
 ## Summary
-<!-- Describe what this PR changes and why -->
+<!-- Explain what this change does and why it is needed -->
 
 ## Changes
 - 
 
-## Type of Change
+## Kind of change
 - [ ] Bug fix
-- [ ] New feature / enhancement
-- [ ] UI / UX parity polish
-- [ ] Go bridge (`whatsbridge`) update
-- [ ] CI / Docs / Release maintenance
+- [ ] Feature work
+- [ ] UI update
+- [ ] Go bridge change (`whatsbridge`)
+- [ ] CI or documentation
 
-## Verification
+## Checks
 - [ ] `cd whatsbridge && go vet ./...` passes
-- [ ] Android APK builds cleanly
-- [ ] Tested on device (screenshots attached below if UI change)
+- [ ] Android APK builds without errors
+- [ ] Tested on a device (attach screenshots for UI changes)

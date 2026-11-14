@@ -1,20 +1,20 @@
-name: General Feedback
-description: Share UI/UX feedback, performance impressions, or general ideas for Wupp.
+name: Feedback
+description: Share feedback on how Wupp looks, feels, or performs
 title: "[Feedback] "
 labels: ["feedback"]
 body:
   - type: textarea
     id: feedback
     attributes:
-      label: Your Feedback
-      description: Tell us what feels great, what feels rough, or what you'd polish next.
+      label: Your feedback
+      description: Share what works well, what feels rough, or what needs polish.
     validations:
       required: true
 
   - type: input
     id: version
     attributes:
-      label: Wupp Version
+      label: Wupp version
       placeholder: v1.0.0
     validations:
       required: false
