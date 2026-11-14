@@ -47,21 +47,21 @@ Under the hood, a Go library (`whatsbridge`, built on `whatsmeow` and compiled t
 2. Walk through the first-launch setup screen so notification, media, and background-running permissions are granted.
 3. Link your WhatsApp account on the setup login screen using either a QR code scan or a phone number link code from **Linked devices** in your primary WhatsApp app.
 
-Future versions prompt inside the app and automatically match your phone's CPU architecture once published on GitHub. If you track releases with [Obtainium](https://github.com/ImranR98/Obtainium), point it at `https://github.com/hanzalaramz/Wupp` and filter assets with `^Wupp-.*-arm64-v8a\.apk$` (or `-universal`; turn on "Include prereleases" for alpha/beta builds).
+Future versions prompt inside the app, automatically match your phone's CPU architecture, and update in place without logging you out of WhatsApp. If you track releases with [Obtainium](https://github.com/ImranR98/Obtainium), point it at `https://github.com/hanzalaramz/Wupp` and filter assets with `^Wupp-.*-arm64-v8a\.apk$` (or `-universal`; turn on "Include prereleases" for alpha/beta builds).
 
 ## What talks to the network
 
 Wupp sends no telemetry, analytics, or crash dumps to any developer server.
 
 - WhatsApp protocol messages, avatars, status updates, channel posts, and media travel directly between your device and WhatsApp servers over `whatsmeow`.
-- Update checks query `https://api.github.com/repos/hanzalaramz/Wupp/releases/latest` (and `/releases?per_page=1` if only pre-releases exist) to read version tags and APK URLs.
-- Bug reports, feature requests, and feedback open GitHub's new-issue page in your browser only when you tap **Open GitHub**.
+- Update checks query `https://api.github.com/repos/hanzalaramz/Wupp/releases/latest` (and `/releases?per_page=1` if only pre-releases exist) to read version tags and APK URLs without needing a GitHub account.
+- Bug reports, feature requests, and feedback open GitHub's new-issue page in your browser only when you tap **Open GitHub** (GitHub asks you to sign in before posting; tap **Copy** to save the text locally without logging in).
 
 Chats, decrypted media, session keys, and preferences remain on your device.
 
 ## Bugs, features, and feedback
 
-Inside Wupp, open **Settings > Updates & GitHub Support** or tap the top-right overflow menu and choose **Report bug / Feedback**. You can also file an issue directly on [GitHub Issues](https://github.com/hanzalaramz/Wupp/issues).
+Inside Wupp, open **Settings > Updates & GitHub Support** or tap the top-right overflow menu and choose **Report bug / Feedback**. Submitting on GitHub requires a GitHub account in your browser, or you can copy the formatted report text directly from the dialog. You can also file an issue directly on [GitHub Issues](https://github.com/hanzalaramz/Wupp/issues).
 
 ## Disclaimer
 
@@ -71,7 +71,7 @@ Wupp is an independent client and is not affiliated with, sponsored by, or endor
 
 ### Layout
 
-`app/` contains the Kotlin and Jetpack Compose Android client (`minSdk = 26`, `targetSdk = 34`, `arm64-v8a`). `whatsbridge/` contains the Go bridge wrapping `go.mau.fi/whatsmeow`, built into `app/libs/whatsbridge.aar`.
+`app/` contains the Kotlin and Jetpack Compose Android client (`applicationId = "com.wupp.app"`, `minSdk = 26`, `targetSdk = 34`, outputting `arm64-v8a` and multi-ABI `universal` release APKs). `whatsbridge/` contains the Go bridge wrapping `go.mau.fi/whatsmeow`, built into `app/libs/whatsbridge.aar` (`arm64-v8a`, `armeabi-v7a`, `x86_64`).
 
 ### Requirements and local build
 
