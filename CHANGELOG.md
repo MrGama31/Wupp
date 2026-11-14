@@ -1,25 +1,12 @@
 # Changelog
 
-All notable user-visible changes to Wupp are listed here in simple words.
-
 ## [Unreleased]
 
 ## [0.1.0] - 2026-11-15
 
-### Added
-- Mandatory login setup screen after permissions, supporting both QR code scanning and phone number link codes before entering chats
-- In-app GitHub release updater with startup checks, notifications, download progress, changelog viewer, and installer handoff
-- In-app bug report, feature request, and feedback forms with one-tap clipboard copy and GitHub pre-fill
-- Multi-ABI Go bridge (`arm64-v8a`, `armeabi-v7a`, `x86_64`) and signed GitHub Releases publishing `arm64-v8a` and `universal` APKs
-- First-launch permission setup screen, privacy toggles (Ghost Mode, read/played/typing controls, anti-delete, view-once vault), channel viewer, status viewer, live message ticks, and emoji reactions
-
-### Changed
-- Set Android package ID to `com.wupp.app`
-- Added sync cooldowns and version caching to cut duplicate WhatsApp server requests without slowing down normal use
-- Publish only `arm64-v8a` and multi-ABI `universal` APKs for GitHub Releases
-
-### Fixed
-- Fixed real-time chat syncing and background push updates
-- Fixed channel (`@newsletter`) images not loading
-- Fixed missing profile pictures across chats, groups, and contacts
-- Fixed initial status updates failing to load on link or launch
+- 🔗 **Mandatory link setup:** after granting permissions, link via QR scan or phone number code before entering chats.
+- 🛡️ **Anti-ban and sync guards:** `Chrome (Mac OS)` companion profile, `90s` global sync cooldowns, jittered 3-worker media/avatar queues, dead-channel skipping, and an outbound guard blocking first messages to unknown numbers with no chat history.
+- 🕵️ **Privacy switches:** Ghost Mode, hold blue read ticks, hide voice played receipts, hide typing/recording, keep deleted messages and statuses, and retain disappearing chats locally.
+- 💬 **Fixed live sync, channels, and avatars:** split live events from heavy history sync so chats update in real time, fixed `@newsletter` channel pictures, profile photos, and initial status loading.
+- 📦 **Signed `arm64-v8a` and `universal` builds:** moved package ID to `com.wupp.app` with multi-ABI `whatsbridge.aar` (`arm64-v8a`, `armeabi-v7a`, `x86_64`) so updates install in place without logging out.
+- 🔄 **In-app updates and issue forms:** automatic GitHub release checks and APK installer handoff, plus pre-filled bug, feature, and feedback dialogs with one-tap copy.
