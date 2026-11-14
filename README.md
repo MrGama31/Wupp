@@ -36,6 +36,8 @@ Use your existing WhatsApp account, chats, groups, status updates, and channels 
 - **Error 463 Outbound Guard:** Blocks sending a first companion message to an unknown number with **zero prior local chat history**, guarding against one of WhatsApp's biggest companion triggers.
 - **Safe Defaults:** Keeps normal read ticks on unless you enable **Ghost Read**, and tracks Meta's **14-day primary phone heartbeat** in Settings.
 
+[![View Full Anti-Ban Explanation](https://img.shields.io/badge/View_Full_Anti--Ban_Explanation-0969DA?style=for-the-badge)](ANTIBAN.md)
+
 ### **Mod Features & Local Vault**
 
 - **Anti-Delete Messages & Statuses:** Keeps text, media, and statuses on your phone even after someone deletes them for everyone.
